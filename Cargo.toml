@@ -1,0 +1,14 @@
+[package]
+name = "paper_scanner"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = "0.4.45"
+clap = { version = "4.6.6", features = ["derive"] }
+dirs = "7.0.0"
+image = "0.25.10"
+imageproc = "0.27.0"
+printpdf = { version = "0.12.8", features = ["jpeg"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_Graphics_Imaging", "Win32_Storage_FileSystem"] }
