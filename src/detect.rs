@@ -17,14 +17,25 @@
 //! 4. Trace contours (Suzuki-Abe border following, via `imageproc::contours`), keep the
 //!    largest plausible outer contour per candidate mask, take its convex hull.
 //! 5. Reduce each hull to 4 corners via the standard min/max(x+y), min/max(x-y) heuristic.
+//!    This labeling is only reliable for tilts within about +-45 degrees of upright; a
+//!    page rotated further than that (e.g. photographed with the phone held sideways
+//!    relative to the page) gets its corners labeled as if rotated an extra 90 degrees,
+//!    which silently swaps width and height. Step 7 corrects for this.
 //! 6. Sanity-check every candidate - big enough to be a document, not so big it's
 //!    obviously the whole scene, roughly rectangular, and not touching all four sides of
 //!    the frame (a real photo of a page almost always has visible margin somewhere; a
 //!    detection that hugs every edge is usually background bleeding in, not a page) - and
 //!    keep the largest one that passes. If nothing plausible was found, fall back to
 //!    treating the entire photo as the "paper" so the program always produces output.
+//! 7. Nudge the winning quad's corner labeling by one quarter-turn if its resulting
+//!    aspect orientation (portrait/landscape) doesn't match the source photo's own -
+//!    the photo's own orientation is a much stronger signal of "how you held it" than
+//!    the raw heuristic, and this is what corrects the >45-degree-tilt case from step 5.
 
-use crate::geometry::{Pt, clamp_to_bounds, convex_hull, expand_quad, extreme_corners, polygon_area};
+use crate::geometry::{
+    Pt, clamp_to_bounds, convex_hull, expand_quad, extreme_corners, polygon_area,
+    quad_output_size,
+};
 use image::{GrayImage, Luma, RgbImage};
 use imageproc::contours::{BorderType, find_contours};
 use imageproc::distance_transform::Norm;
@@ -126,8 +137,9 @@ pub fn detect_paper(img: &RgbImage) -> Detection {
             // photo, so a slightly-too-tight detection doesn't shave off the page edge.
             let expanded = expand_quad(full_corners, EDGE_FILL_FACTOR);
             let clamped = clamp_to_bounds(expanded, full_w as f64, full_h as f64);
+            let oriented = match_photo_orientation(clamped, full_w, full_h);
             Detection {
-                corners: clamped,
+                corners: oriented,
                 used_fallback: false,
             }
         }
@@ -135,6 +147,23 @@ pub fn detect_paper(img: &RgbImage) -> Detection {
             corners: full_image_quad(full_w, full_h),
             used_fallback: true,
         },
+    }
+}
+
+/// Corrects the >45-degree-tilt corner-labeling wraparound described at the top of this
+/// file: if the quad's own width/height relationship disagrees with the source photo's
+/// (e.g. we'd output landscape from a portrait photo), the labeling must have wrapped by
+/// one quarter-turn, so shift it back. This is a pure relabeling of the same 4 points -
+/// it never changes the detected geometry, only which corner is called what.
+fn match_photo_orientation(corners: [Pt; 4], photo_w: u32, photo_h: u32) -> [Pt; 4] {
+    if photo_w == photo_h {
+        return corners;
+    }
+    let (w, h) = quad_output_size(corners);
+    if (w > h) != (photo_w > photo_h) {
+        [corners[1], corners[2], corners[3], corners[0]]
+    } else {
+        corners
     }
 }
 
@@ -269,4 +298,98 @@ fn find_paper_hull(gray: &GrayImage, is_foreground: impl Fn(u8) -> bool) -> Opti
     }
 
     best
+}
+
+#[cfg(test)]
+mod orientation_tests {
+    use super::*;
+
+    /// Rotates a portrait rectangle's corners by `degrees` (about its own top-left, in
+    /// image-space where +y is down) and runs them through the same
+    /// `extreme_corners` labeling `detect_paper` uses internally, to reproduce the
+    /// wraparound bug independent of image decoding/thresholding.
+    fn labeled_after_rotation(degrees: f64) -> [Pt; 4] {
+        let (w, h) = (850.0, 1100.0); // portrait: narrower than tall
+        let theta = degrees.to_radians();
+        let (c, s) = (theta.cos(), theta.sin());
+        let rotate = |x: f64, y: f64| Pt::new(x * c - y * s, x * s + y * c);
+        let corners = [
+            rotate(0.0, 0.0),
+            rotate(w, 0.0),
+            rotate(w, h),
+            rotate(0.0, h),
+        ];
+        let hull = convex_hull(&corners);
+        extreme_corners(&hull)
+    }
+
+    #[test]
+    fn mild_tilt_needs_no_correction() {
+        // Comfortably within +-45 degrees: a normal, slightly-crooked photo.
+        for degrees in [0.0, 15.0, 30.0, -30.0, 44.0] {
+            let labeled = labeled_after_rotation(degrees);
+            let (w, h) = quad_output_size(labeled);
+            assert!(
+                h > w,
+                "at {degrees} degrees, expected portrait (h>w) but got {w}x{h}"
+            );
+            // Photo itself would be portrait-ish here, so no relabeling should occur.
+            assert_eq!(match_photo_orientation(labeled, 850, 1100), labeled);
+        }
+    }
+
+    #[test]
+    fn steep_tilt_swaps_dimensions_without_correction() {
+        // This reproduces the reported bug directly: a portrait page tilted past 45
+        // degrees (e.g. phone held sideways relative to the page) comes out labeled
+        // as landscape by the raw heuristic.
+        for degrees in [60.0, 90.0, 120.0, -60.0, -90.0, -120.0] {
+            let labeled = labeled_after_rotation(degrees);
+            let (w, h) = quad_output_size(labeled);
+            assert!(
+                w > h,
+                "at {degrees} degrees, expected the raw heuristic to (incorrectly) \
+                 produce landscape (w>h) but got {w}x{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn orientation_fix_recovers_portrait_from_a_portrait_photo() {
+        // The photo itself was taken as portrait (height > width) - the strongest
+        // signal we have of user intent - so the corrected output must be portrait
+        // too, regardless of how far the page was tilted inside the frame.
+        for degrees in [0.0, 30.0, 60.0, 90.0, 120.0, -60.0, -90.0, -120.0] {
+            let labeled = labeled_after_rotation(degrees);
+            let corrected = match_photo_orientation(labeled, 850, 1100);
+            let (w, h) = quad_output_size(corrected);
+            assert!(
+                h > w,
+                "at {degrees} degrees, expected corrected output to be portrait \
+                 (h>w) matching the portrait source photo, but got {w}x{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn orientation_fix_is_a_pure_relabeling_not_a_geometry_change() {
+        // Corrected corners must be the exact same 4 points, just reordered - never
+        // synthesized or moved.
+        let labeled = labeled_after_rotation(90.0);
+        let corrected = match_photo_orientation(labeled, 850, 1100);
+        let mut original_sorted = labeled.to_vec();
+        let mut corrected_sorted = corrected.to_vec();
+        let key = |p: &Pt| (p.x * 1000.0).round() as i64 * 10_000_000 + (p.y * 1000.0).round() as i64;
+        original_sorted.sort_by_key(key);
+        corrected_sorted.sort_by_key(key);
+        for (a, b) in original_sorted.iter().zip(corrected_sorted.iter()) {
+            assert!((a.x - b.x).abs() < 1e-6 && (a.y - b.y).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn square_photo_is_left_alone() {
+        let labeled = labeled_after_rotation(90.0);
+        assert_eq!(match_photo_orientation(labeled, 1000, 1000), labeled);
+    }
 }

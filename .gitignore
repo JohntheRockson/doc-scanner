@@ -1,2 +1,7 @@
 /target
 /test_assets
+
+# Enviroment Secrets
+.env
+.env.*
+*.env

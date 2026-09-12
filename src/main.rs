@@ -4,6 +4,7 @@ mod enhance;
 mod geometry;
 mod heic;
 mod pdf;
+mod r2;
 
 use anyhow::{Context, Result};
 use chrono::{Datelike, NaiveDate, TimeZone};
@@ -15,24 +16,59 @@ use imageproc::geometric_transformations::{Border, Interpolation, Projection, wa
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-/// Default folder new phone photos land in via OneDrive Camera Upload.
+/// Default folder new phone photos land in via OneDrive Camera Upload (used only in
+/// `--local` mode).
 const DEFAULT_INPUT_DIR: &str = r"C:\Users\miskh\OneDrive\Pictures\Camera Roll 1";
 
 fn main() -> Result<()> {
+    // Non-fatal if missing: local mode needs no Cloudflare config at all.
+    let _ = dotenvy::dotenv();
+
     let args = Args::parse();
     heic::init_com();
 
+    if is_local_mode(&args) {
+        run_local(&args)
+    } else {
+        run_remote(&args)
+    }
+}
+
+/// Local mode is used when `--local` is passed, or when any named item already exists
+/// on disk - so existing habits (pointing the tool straight at a file) keep working
+/// without having to remember a new flag.
+fn is_local_mode(args: &Args) -> bool {
+    args.local || args.items.iter().any(|s| Path::new(s).exists())
+}
+
+// ================================ Local filesystem mode =================================
+
+fn run_local(args: &Args) -> Result<()> {
     let now = SystemTime::now();
-    let inputs = gather_inputs(&args, now)?;
+    let inputs = gather_local_inputs(args, now)?;
+
+    if args.list {
+        if inputs.is_empty() {
+            println!("No local files found.");
+        } else {
+            println!("{} local file(s) found:", inputs.len());
+            for p in &inputs {
+                println!("  - {}", p.display());
+            }
+        }
+        return Ok(());
+    }
 
     if inputs.is_empty() {
-        if args.paths.is_empty() {
+        if args.items.is_empty() {
+            let minutes = args.minutes.unwrap_or(5);
             let month_dir = current_month_dir(now);
             println!(
-                "No .heic/.heif files found in the last {} minute(s) under:\n  {}\n\
+                "No .heic/.heif files found in the last {minutes} minute(s) under:\n  {}\n\
                  including dated folders such as:\n  {}\n\
                  (Pass --all to ignore the time window, or --minutes to widen it.)",
-                args.minutes, DEFAULT_INPUT_DIR, month_dir.display()
+                DEFAULT_INPUT_DIR,
+                month_dir.display()
             );
         } else {
             println!("No matching .heic/.heif files found in the given paths.");
@@ -58,7 +94,7 @@ fn main() -> Result<()> {
         anyhow::bail!("None of the input photos could be processed.");
     }
 
-    let output_path = resolve_output(&args.output)?;
+    let output_path = resolve_output(&args.output, &args.name)?;
     pdf::write_pdf(&pages, &output_path)?;
 
     println!(
@@ -69,7 +105,311 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Resolves the final list of local input files. Explicit files are always processed.
+/// Directories — including the default Camera Roll folder — are walked recursively so
+/// dated `YYYY\MM` subfolders are included, then filtered by the time window unless
+/// `--all` is set.
+fn gather_local_inputs(args: &Args, now: SystemTime) -> Result<Vec<PathBuf>> {
+    let minutes = args.minutes.unwrap_or(5);
+    let window = Duration::from_secs(minutes.saturating_mul(60));
+    let mut files = Vec::new();
+
+    if args.items.is_empty() {
+        let dir = PathBuf::from(DEFAULT_INPUT_DIR);
+        if dir.is_dir() {
+            collect_from_dir_recursive(&dir, window, args.all, now, &mut files)?;
+        }
+    } else {
+        for item in &args.items {
+            let p = PathBuf::from(item);
+            if p.is_dir() {
+                collect_from_dir_recursive(&p, window, args.all, now, &mut files)?;
+            } else if p.is_file() {
+                files.push(p);
+            } else {
+                eprintln!("Warning: '{item}' doesn't exist, skipping.");
+            }
+        }
+    }
+
+    // De-duplicate by filename, not just full path: OneDrive can transiently show the
+    // same photo in both the flat root and a dated subfolder while it's mid-archive, and
+    // we'd otherwise scan it twice and duplicate it in the output PDF.
+    let mut seen_names = std::collections::HashSet::new();
+    files.retain(|p| {
+        p.file_name()
+            .map(|name| seen_names.insert(name.to_os_string()))
+            .unwrap_or(true)
+    });
+
+    // Chronological order, so PDF pages come out in the order the photos were taken.
+    // Prefer the timestamp encoded in typical camera filenames (e.g.
+    // `20260909_045421598_iOS.heic`) over filesystem mtime: OneDrive's sync/archiving
+    // can rewrite mtimes out of true capture order, but the filename's own timestamp
+    // doesn't move.
+    files.sort_by_key(|p| {
+        let filename_ts = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(parse_filename_timestamp);
+        let mtime = std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        (filename_ts.unwrap_or(0), mtime)
+    });
+    Ok(files)
+}
+
+/// Walks `dir` and every subdirectory. OneDrive Camera Roll photos live both at the root
+/// *and* in dated `YYYY\MM` folders; we have to recurse or the month folders are skipped.
+fn collect_from_dir_recursive(
+    dir: &Path,
+    window: Duration,
+    all: bool,
+    now: SystemTime,
+    out: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let entries =
+        std::fs::read_dir(dir).with_context(|| format!("reading directory {}", dir.display()))?;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_from_dir_recursive(&path, window, all, now, out)?;
+            continue;
+        }
+        if !is_image_file(&path) {
+            continue;
+        }
+        if all {
+            out.push(path);
+            continue;
+        }
+        let meta = entry.metadata()?;
+        if is_recent_photo(&path, &meta, window, now) {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn current_month_dir(now: SystemTime) -> PathBuf {
+    let dt: chrono::DateTime<chrono::Local> = now.into();
+    PathBuf::from(DEFAULT_INPUT_DIR)
+        .join(format!("{:04}", dt.year()))
+        .join(format!("{:02}", dt.month()))
+}
+
+// =================================== Cloudflare R2 mode ===================================
+
+fn run_remote(args: &Args) -> Result<()> {
+    let cfg = r2::R2Config::from_env()?;
+    let client = r2::build_client(&cfg);
+    let rt = tokio::runtime::Runtime::new().context("starting the async runtime for R2 access")?;
+
+    let mut objects = rt
+        .block_on(r2::list_objects(&client, &cfg.bucket, args.prefix.as_deref()))
+        .with_context(|| format!("connecting to R2 bucket '{}'", cfg.bucket))?;
+    objects.sort_by(|a, b| a.key.cmp(&b.key));
+
+    if args.list {
+        if objects.is_empty() {
+            println!("R2 bucket '{}' is empty.", cfg.bucket);
+        } else {
+            println!("{} file(s) in R2 bucket '{}':", objects.len(), cfg.bucket);
+            for o in &objects {
+                println!(
+                    "  {:<42} {:>9}   {}",
+                    o.key,
+                    format_size(o.size),
+                    format_time(o.last_modified)
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    let image_objects: Vec<r2::RemoteObject> = objects
+        .into_iter()
+        .filter(|o| is_image_file(Path::new(&o.key)))
+        .collect();
+
+    let (mut selected, not_found) = if args.items.is_empty() {
+        (image_objects, Vec::new())
+    } else {
+        select_remote_objects(image_objects, &args.items)
+    };
+
+    for missing in &not_found {
+        eprintln!("Warning: '{missing}' wasn't found in the R2 bucket, skipping.");
+    }
+
+    // Explicitly-named items are always processed regardless of age, same as local mode.
+    // With no selection, Cloudflare mode defaults to "everything in the bucket" - only
+    // apply a time filter if the user actually asked for one.
+    if args.items.is_empty() && !args.all && let Some(minutes) = args.minutes {
+        let now = SystemTime::now();
+        let window = Duration::from_secs(minutes.saturating_mul(60));
+        selected.retain(|o| object_is_recent(o, window, now));
+    }
+
+    if selected.is_empty() {
+        println!(
+            "No matching files found in R2 bucket '{}'.\n\
+             (Pass --list to see what's there, or --local to scan local files instead.)",
+            cfg.bucket
+        );
+        return Ok(());
+    }
+
+    println!(
+        "Found {} photo(s) in R2 bucket '{}':",
+        selected.len(),
+        cfg.bucket
+    );
+    for o in &selected {
+        println!("  - {}", o.key);
+    }
+    println!();
+
+    let temp_dir = std::env::temp_dir().join("paper_scanner_r2");
+    std::fs::create_dir_all(&temp_dir).context("creating a temp directory for downloads")?;
+
+    let mut pages = Vec::new();
+    let mut processed_keys = Vec::new();
+
+    for (idx, obj) in selected.iter().enumerate() {
+        println!("Downloading {}...", obj.key);
+        let bytes = match rt.block_on(r2::download_object(&client, &cfg.bucket, &obj.key)) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("Skipping '{}': {e:#}", obj.key);
+                continue;
+            }
+        };
+
+        let temp_path = temp_dir.join(format!("{idx}_{}", temp_filename_for_key(&obj.key)));
+        if let Err(e) = std::fs::write(&temp_path, &bytes) {
+            eprintln!("Skipping '{}': couldn't write a temp file ({e:#})", obj.key);
+            continue;
+        }
+
+        let result = process_one(&temp_path, args.mode, &args.debug);
+        let _ = std::fs::remove_file(&temp_path);
+
+        match result {
+            Ok(img) => {
+                pages.push(img);
+                processed_keys.push(obj.key.clone());
+            }
+            Err(e) => eprintln!("Skipping '{}': {e:#}", obj.key),
+        }
+    }
+
+    if pages.is_empty() {
+        anyhow::bail!("None of the R2 photos could be processed.");
+    }
+
+    let output_path = resolve_output(&args.output, &args.name)?;
+    pdf::write_pdf(&pages, &output_path)?;
+
+    println!(
+        "\nSaved a {}-page scanned PDF to:\n  {}",
+        pages.len(),
+        output_path.display()
+    );
+
+    if args.keep_remote {
+        println!(
+            "Left {} file(s) in the R2 bucket (--keep-remote was set).",
+            processed_keys.len()
+        );
+    } else {
+        println!("Deleting {} file(s) from R2...", processed_keys.len());
+        let mut failures = 0u32;
+        for key in &processed_keys {
+            if let Err(e) = rt.block_on(r2::delete_object(&client, &cfg.bucket, key)) {
+                eprintln!("  warning: couldn't delete '{key}' from R2: {e:#}");
+                failures += 1;
+            }
+        }
+        if failures == 0 {
+            println!("Done - the R2 bucket is clear of the scanned photos.");
+        } else {
+            println!("Done, but {failures} file(s) could not be deleted from R2 (see warnings above).");
+        }
+    }
+
+    Ok(())
+}
+
+/// Matches user-provided item names against bucket keys, by exact key or by filename
+/// alone (so you don't have to type a folder-style prefix). Returns the matched objects
+/// plus any requested names that weren't found in the bucket.
+fn select_remote_objects(
+    all: Vec<r2::RemoteObject>,
+    items: &[String],
+) -> (Vec<r2::RemoteObject>, Vec<String>) {
+    let mut selected = Vec::new();
+    let mut not_found = Vec::new();
+
+    for item in items {
+        let found = all.iter().find(|o| {
+            o.key.eq_ignore_ascii_case(item)
+                || Path::new(&o.key)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.eq_ignore_ascii_case(item))
+                    .unwrap_or(false)
+        });
+        match found {
+            Some(o) => selected.push(o.clone()),
+            None => not_found.push(item.clone()),
+        }
+    }
+    (selected, not_found)
+}
+
+fn object_is_recent(obj: &r2::RemoteObject, window: Duration, now: SystemTime) -> bool {
+    match obj.last_modified {
+        Some(t) => now.duration_since(t).map(|age| age <= window).unwrap_or(true),
+        None => true,
+    }
+}
+
+fn temp_filename_for_key(key: &str) -> String {
+    Path::new(key)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "download.heic".to_string())
+}
+
+fn format_size(bytes: i64) -> String {
+    let b = bytes as f64;
+    if b >= 1_000_000.0 {
+        format!("{:.1} MB", b / 1_000_000.0)
+    } else if b >= 1_000.0 {
+        format!("{:.1} KB", b / 1_000.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn format_time(t: Option<SystemTime>) -> String {
+    match t {
+        Some(t) => {
+            let dt: chrono::DateTime<chrono::Local> = t.into();
+            dt.format("%Y-%m-%d %H:%M").to_string()
+        }
+        None => "-".to_string(),
+    }
+}
+
+// ============================ Shared: per-photo processing pipeline ============================
+
 /// Decodes, detects the paper, perspective-corrects, and cleans up shading for one photo.
+/// Used identically whether the file came from disk or was just downloaded from R2.
 fn process_one(path: &Path, mode: ScanMode, debug_dir: &Option<PathBuf>) -> Result<RgbImage> {
     let file_label = path.file_name().unwrap_or_default().to_string_lossy().to_string();
     println!("Processing {file_label}...");
@@ -322,99 +662,6 @@ fn filename_datetime_parts(name: &str) -> Option<(i32, u32, u32, u32, u32, u32)>
     Some((year, month, day, hour, min, sec))
 }
 
-/// Walks `dir` and every subdirectory. OneDrive Camera Roll photos live both at the root
-/// *and* in dated `YYYY\MM` folders; we have to recurse or the month folders are skipped.
-fn collect_from_dir_recursive(
-    dir: &Path,
-    window: Duration,
-    all: bool,
-    now: SystemTime,
-    out: &mut Vec<PathBuf>,
-) -> Result<()> {
-    let entries =
-        std::fs::read_dir(dir).with_context(|| format!("reading directory {}", dir.display()))?;
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_from_dir_recursive(&path, window, all, now, out)?;
-            continue;
-        }
-        if !is_image_file(&path) {
-            continue;
-        }
-        if all {
-            out.push(path);
-            continue;
-        }
-        let meta = entry.metadata()?;
-        if is_recent_photo(&path, &meta, window, now) {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
-fn current_month_dir(now: SystemTime) -> PathBuf {
-    let dt: chrono::DateTime<chrono::Local> = now.into();
-    PathBuf::from(DEFAULT_INPUT_DIR)
-        .join(format!("{:04}", dt.year()))
-        .join(format!("{:02}", dt.month()))
-}
-
-/// Resolves the final list of input files. Explicit files are always processed.
-/// Directories — including the default Camera Roll folder — are walked recursively
-/// so dated `YYYY\MM` subfolders are included, then filtered by the time window
-/// unless `--all` is set.
-fn gather_inputs(args: &Args, now: SystemTime) -> Result<Vec<PathBuf>> {
-    let window = Duration::from_secs(args.minutes.saturating_mul(60));
-    let mut files = Vec::new();
-
-    if args.paths.is_empty() {
-        let dir = PathBuf::from(DEFAULT_INPUT_DIR);
-        if dir.is_dir() {
-            collect_from_dir_recursive(&dir, window, args.all, now, &mut files)?;
-        }
-    } else {
-        for p in &args.paths {
-            if p.is_dir() {
-                collect_from_dir_recursive(p, window, args.all, now, &mut files)?;
-            } else if p.is_file() {
-                files.push(p.clone());
-            } else {
-                eprintln!("Warning: '{}' doesn't exist, skipping.", p.display());
-            }
-        }
-    }
-
-    // De-duplicate by filename, not just full path: OneDrive can transiently show the
-    // same photo in both the flat root and a dated subfolder while it's mid-archive, and
-    // we'd otherwise scan it twice and duplicate it in the output PDF.
-    let mut seen_names = std::collections::HashSet::new();
-    files.retain(|p| {
-        p.file_name()
-            .map(|name| seen_names.insert(name.to_os_string()))
-            .unwrap_or(true)
-    });
-
-    // Chronological order, so PDF pages come out in the order the photos were taken.
-    // Prefer the timestamp encoded in typical camera filenames (e.g.
-    // `20260909_045421598_iOS.heic`) over filesystem mtime: OneDrive's sync/archiving
-    // can rewrite mtimes out of true capture order, but the filename's own timestamp
-    // doesn't move.
-    files.sort_by_key(|p| {
-        let filename_ts = p
-            .file_name()
-            .and_then(|n| n.to_str())
-            .and_then(parse_filename_timestamp);
-        let mtime = std::fs::metadata(p)
-            .and_then(|m| m.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        (filename_ts.unwrap_or(0), mtime)
-    });
-    Ok(files)
-}
-
 /// Parses a leading `YYYYMMDD_HHMMSS` (optionally `...mmm` milliseconds) prefix, as used
 /// by iOS/Android camera exports, into a single comparable integer. Returns `None` for
 /// filenames that don't start with that pattern.
@@ -437,25 +684,46 @@ fn parse_filename_timestamp(name: &str) -> Option<i64> {
         .ok()
 }
 
-/// Resolves the output PDF path: an explicit `.pdf` file wins outright, an explicit
-/// directory gets an auto-named file inside it, and with nothing specified we fall back
-/// to the user's Downloads folder.
-fn resolve_output(output: &Option<PathBuf>) -> Result<PathBuf> {
-    let stamp = chrono::Local::now().format("%Y-%m-%d_%H%M%S");
-    let auto_name = format!("Scan_{stamp}.pdf");
+// ==================================== Shared: output path ====================================
+
+/// Resolves the output PDF path.
+/// - An explicit `--output` ending in `.pdf` is used as-is (and `--name` is ignored).
+/// - Otherwise `--output` (or the Downloads folder, by default) is treated as a
+///   directory, and `--name` (or an auto-generated timestamp) supplies the filename.
+fn resolve_output(output: &Option<PathBuf>, name: &Option<String>) -> Result<PathBuf> {
+    let filename = match name {
+        Some(n) => {
+            let n = n.trim();
+            if n.to_ascii_lowercase().ends_with(".pdf") {
+                n.to_string()
+            } else {
+                format!("{n}.pdf")
+            }
+        }
+        None => {
+            let stamp = chrono::Local::now().format("%Y-%m-%d_%H%M%S");
+            format!("Scan_{stamp}.pdf")
+        }
+    };
 
     let resolved = match output {
         Some(p) if p.extension().map(|e| e.eq_ignore_ascii_case("pdf")).unwrap_or(false) => {
+            if name.is_some() {
+                eprintln!(
+                    "Note: --output already names a file ('{}'), ignoring --name.",
+                    p.display()
+                );
+            }
             p.clone()
         }
-        Some(p) => p.join(&auto_name),
+        Some(dir) => dir.join(&filename),
         None => {
             let downloads = dirs::download_dir().unwrap_or_else(|| {
                 dirs::home_dir()
                     .unwrap_or_else(|| PathBuf::from("."))
                     .join("Downloads")
             });
-            downloads.join(&auto_name)
+            downloads.join(&filename)
         }
     };
     Ok(resolved)
