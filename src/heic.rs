@@ -114,11 +114,19 @@ fn read_orientation(frame: &IWICBitmapFrameDecode) -> u32 {
     use windows::core::w;
 
     // Different container formats expose EXIF metadata at slightly different query
-    // paths; HEIC generally uses the same IFD-style paths as TIFF/JPEG under WIC.
+    // paths. Orientation (tag 0x0112/274) lives directly in IFD0, NOT in the nested
+    // "Exif" sub-IFD (tag 0x8769, which holds things like ExposureTime/FNumber) - so
+    // paths with an `/exif/` segment never match it. `/app1/ifd/{ushort=274}` is the
+    // real JPEG (APP1) path; some files carrying a `.heic` extension are actually
+    // plain re-encoded JPEGs under the hood (e.g. from iOS Shortcuts pipelines), so we
+    // must check it. `/ifd/{ushort=274}` covers bare-TIFF/HEIF-style roots. The
+    // `/exif/` variants are kept as harmless extra fallbacks in case some encoder
+    // duplicates the tag there too.
     let candidates = [
+        w!("/app1/ifd/{ushort=274}"),
+        w!("/ifd/{ushort=274}"),
         w!("/app1/ifd/exif/{ushort=274}"),
         w!("/ifd/exif/{ushort=274}"),
-        w!("/ifd/{ushort=274}"),
     ];
 
     let reader = match unsafe { frame.GetMetadataQueryReader() } {
