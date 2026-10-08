@@ -37,7 +37,11 @@ fn read_boxes(buf: &[u8]) -> Vec<BoxHeader> {
         }
         let content_start = pos + header_len as usize;
         let content_end = pos + total_size as usize;
-        out.push(BoxHeader { kind, start: content_start, end: content_end });
+        out.push(BoxHeader {
+            kind,
+            start: content_start,
+            end: content_end,
+        });
         pos = content_end;
     }
     out
@@ -52,7 +56,9 @@ fn find<'a>(boxes: &'a [BoxHeader], name: &str) -> Option<&'a BoxHeader> {
 }
 
 fn main() {
-    let path = env::args().nth(1).expect("usage: heif_box_dump <file.heic>");
+    let path = env::args()
+        .nth(1)
+        .expect("usage: heif_box_dump <file.heic>");
     let buf = fs::read(&path).expect("read file");
     println!("== {path} ({} bytes) ==", buf.len());
 
@@ -69,7 +75,13 @@ fn main() {
     println!();
 
     let top = read_boxes(&buf);
-    println!("Top-level boxes: {}", top.iter().map(|b| kind_str(&b.kind)).collect::<Vec<_>>().join(", "));
+    println!(
+        "Top-level boxes: {}",
+        top.iter()
+            .map(|b| kind_str(&b.kind))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
     let meta = match find(&top, "meta") {
         Some(b) => b,
@@ -83,7 +95,11 @@ fn main() {
     let meta_children = read_boxes(&buf[meta_children_start..meta.end]);
     println!(
         "meta children: {}",
-        meta_children.iter().map(|b| kind_str(&b.kind)).collect::<Vec<_>>().join(", ")
+        meta_children
+            .iter()
+            .map(|b| kind_str(&b.kind))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
 
     // ---- iprp/ipco: look for irot/imir transform properties ----
@@ -91,7 +107,14 @@ fn main() {
         let iprp_abs_start = meta_children_start + iprp.start;
         let iprp_abs_end = meta_children_start + iprp.end;
         let iprp_children = read_boxes(&buf[iprp_abs_start..iprp_abs_end]);
-        println!("iprp children: {}", iprp_children.iter().map(|b| kind_str(&b.kind)).collect::<Vec<_>>().join(", "));
+        println!(
+            "iprp children: {}",
+            iprp_children
+                .iter()
+                .map(|b| kind_str(&b.kind))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         if let Some(ipco) = find(&iprp_children, "ipco") {
             let ipco_abs_start = iprp_abs_start + ipco.start;
             let ipco_abs_end = iprp_abs_start + ipco.end;
@@ -105,15 +128,22 @@ fn main() {
                 if name == "irot" {
                     found_transform = true;
                     let angle_byte = buf[abs_start] & 0x03;
-                    println!("  [{i}] irot  angle_field={angle_byte} (=> {} degrees CW per HEIF spec)", angle_byte as u32 * 90);
+                    println!(
+                        "  [{i}] irot  angle_field={angle_byte} (=> {} degrees CW per HEIF spec)",
+                        angle_byte as u32 * 90
+                    );
                 } else if name == "imir" {
                     found_transform = true;
                     let axis_byte = buf[abs_start] & 0x01;
                     println!("  [{i}] imir  axis_field={axis_byte}");
                 } else if name == "ispe" {
                     if abs_end - abs_start >= 12 {
-                        let w = u32::from_be_bytes(buf[abs_start + 4..abs_start + 8].try_into().unwrap());
-                        let h = u32::from_be_bytes(buf[abs_start + 8..abs_start + 12].try_into().unwrap());
+                        let w = u32::from_be_bytes(
+                            buf[abs_start + 4..abs_start + 8].try_into().unwrap(),
+                        );
+                        let h = u32::from_be_bytes(
+                            buf[abs_start + 8..abs_start + 12].try_into().unwrap(),
+                        );
                         println!("  [{i}] ispe  (declared image size) {w}x{h}");
                     }
                 } else {
@@ -121,7 +151,9 @@ fn main() {
                 }
             }
             if !found_transform {
-                println!("  ===> NO irot/imir property present anywhere in this file's ipco. There is zero container-level rotation signal.");
+                println!(
+                    "  ===> NO irot/imir property present anywhere in this file's ipco. There is zero container-level rotation signal."
+                );
             }
         } else {
             println!("No 'ipco' box inside iprp.");
@@ -134,7 +166,12 @@ fn main() {
     dump_exif_orientation(&buf, meta, meta_children_start, &meta_children);
 }
 
-fn dump_exif_orientation(buf: &[u8], _meta: &BoxHeader, meta_children_start: usize, meta_children: &[BoxHeader]) {
+fn dump_exif_orientation(
+    buf: &[u8],
+    _meta: &BoxHeader,
+    meta_children_start: usize,
+    meta_children: &[BoxHeader],
+) {
     let iinf = match find(meta_children, "iinf") {
         Some(b) => b,
         None => {
@@ -166,7 +203,8 @@ fn dump_exif_orientation(buf: &[u8], _meta: &BoxHeader, meta_children_start: usi
         let infe_ver = buf[abs_start];
         // version >= 2 is what modern HEIC uses.
         let (item_id, type_off) = if infe_ver == 2 {
-            let id = u16::from_be_bytes(buf[abs_start + 4..abs_start + 6].try_into().unwrap()) as u32;
+            let id =
+                u16::from_be_bytes(buf[abs_start + 4..abs_start + 6].try_into().unwrap()) as u32;
             (id, abs_start + 8)
         } else if infe_ver == 3 {
             let id = u32::from_be_bytes(buf[abs_start + 4..abs_start + 8].try_into().unwrap());
@@ -185,7 +223,9 @@ fn dump_exif_orientation(buf: &[u8], _meta: &BoxHeader, meta_children_start: usi
             id
         }
         None => {
-            println!("No item of type 'Exif' found in iinf - there is no EXIF blob in this file at all.");
+            println!(
+                "No item of type 'Exif' found in iinf - there is no EXIF blob in this file at all."
+            );
             return;
         }
     };
@@ -247,7 +287,8 @@ fn dump_exif_orientation(buf: &[u8], _meta: &BoxHeader, meta_children_start: usi
                 let abs = (base_offset + ext_offset) as usize;
                 // Per HEIF: first 4 bytes = big-endian offset to the TIFF header from the
                 // byte immediately following this 4-byte field.
-                let tiff_rel_offset = u32::from_be_bytes(buf[abs..abs + 4].try_into().unwrap()) as usize;
+                let tiff_rel_offset =
+                    u32::from_be_bytes(buf[abs..abs + 4].try_into().unwrap()) as usize;
                 let tiff_start = abs + 4 + tiff_rel_offset;
                 parse_tiff_orientation(buf, tiff_start);
             }
@@ -271,7 +312,14 @@ fn read_sized(buf: &[u8], pos: &mut usize, size: u8) -> u64 {
 fn parse_tiff_orientation(buf: &[u8], tiff_start: usize) {
     let byte_order = &buf[tiff_start..tiff_start + 2];
     let little_endian = byte_order == b"II";
-    println!("TIFF header at file offset {tiff_start}, byte order = {}", if little_endian { "little (II)" } else { "big (MM)" });
+    println!(
+        "TIFF header at file offset {tiff_start}, byte order = {}",
+        if little_endian {
+            "little (II)"
+        } else {
+            "big (MM)"
+        }
+    );
     let read_u16 = |p: usize| -> u16 {
         if little_endian {
             u16::from_le_bytes(buf[p..p + 2].try_into().unwrap())

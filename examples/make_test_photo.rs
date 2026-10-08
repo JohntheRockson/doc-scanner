@@ -24,11 +24,16 @@ use windows::Win32::Graphics::Imaging::{
     WICBitmapEncoderNoCache, WICBitmapPaletteTypeCustom,
 };
 use windows::Win32::System::Com::StructuredStorage::IPropertyBag2;
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx};
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+};
 use windows::core::PCWSTR;
 
 fn to_wide(path: &Path) -> Vec<u16> {
-    path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 /// A tiny deterministic PRNG so the test image is reproducible without pulling in `rand`.
@@ -90,10 +95,7 @@ fn make_synthetic_photo() -> RgbImage {
         ])
     });
 
-    let (pw, ph) = (
-        (w as f32 * 0.708) as u32,
-        (h as f32 * 0.6875) as u32,
-    );
+    let (pw, ph) = ((w as f32 * 0.708) as u32, (h as f32 * 0.6875) as u32);
     let flat_page = make_flat_page(pw, ph);
 
     // Keystone quad: a clear perspective distortion, comfortably inside the frame.
@@ -193,7 +195,14 @@ fn encode_heic(img: &RgbImage, path: &Path) -> windows::core::Result<()> {
             img.as_raw(),
         )?;
         let converter: IWICFormatConverter = factory.CreateFormatConverter()?;
-        converter.Initialize(&source_bitmap, &format, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom)?;
+        converter.Initialize(
+            &source_bitmap,
+            &format,
+            WICBitmapDitherTypeNone,
+            None,
+            0.0,
+            WICBitmapPaletteTypeCustom,
+        )?;
 
         frame.WriteSource(&converter, std::ptr::null())?;
 

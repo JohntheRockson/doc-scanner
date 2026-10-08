@@ -19,11 +19,16 @@ use windows::Win32::Graphics::Imaging::{
     WICBitmapEncoderNoCache, WICBitmapPaletteTypeCustom,
 };
 use windows::Win32::System::Com::StructuredStorage::IPropertyBag2;
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx};
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+};
 use windows::core::PCWSTR;
 
 fn to_wide(path: &Path) -> Vec<u16> {
-    path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 struct Lcg(u32);
@@ -63,7 +68,10 @@ fn make_flat_page(w: u32, h: u32) -> RgbImage {
 
 fn main() {
     let mut args = env::args().skip(1);
-    let out: PathBuf = args.next().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("test_assets/rotated_test.heic"));
+    let out: PathBuf = args
+        .next()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("test_assets/rotated_test.heic"));
     let degrees: f32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(75.0);
 
     if let Some(parent) = out.parent() {
@@ -75,7 +83,11 @@ fn main() {
     let mut rng = Lcg(0x1234_5678);
     let mut photo: RgbImage = ImageBuffer::from_fn(pw, ph, |_, _| {
         let grain = rng.range(20) - 10;
-        Rgb([(55 + grain).clamp(0, 255) as u8, (40 + grain).clamp(0, 255) as u8, (32 + grain).clamp(0, 255) as u8])
+        Rgb([
+            (55 + grain).clamp(0, 255) as u8,
+            (40 + grain).clamp(0, 255) as u8,
+            (32 + grain).clamp(0, 255) as u8,
+        ])
     });
 
     // Portrait page (narrower than tall), tilted by `degrees` - past the 45-degree
@@ -84,7 +96,12 @@ fn main() {
     let theta = degrees.to_radians();
     let (c, s) = (theta.cos(), theta.sin());
     let rotate = |x: f32, y: f32| (x * c - y * s, x * s + y * c);
-    let raw = [rotate(0.0, 0.0), rotate(fw as f32, 0.0), rotate(fw as f32, fh as f32), rotate(0.0, fh as f32)];
+    let raw = [
+        rotate(0.0, 0.0),
+        rotate(fw as f32, 0.0),
+        rotate(fw as f32, fh as f32),
+        rotate(0.0, fh as f32),
+    ];
 
     let min_x = raw.iter().map(|p| p.0).fold(f32::MAX, f32::min);
     let max_x = raw.iter().map(|p| p.0).fold(f32::MIN, f32::max);
@@ -95,18 +112,37 @@ fn main() {
     let quad_f32: [(f32, f32); 4] = raw.map(|(x, y)| (x + cx, y + cy));
 
     println!("Rotation: {degrees} degrees. Quad corners in photo space: {quad_f32:?}");
-    println!("(Flat page is {fw}x{fh} portrait; quad's own long axis is now tilted {degrees} degrees from vertical.)");
+    println!(
+        "(Flat page is {fw}x{fh} portrait; quad's own long axis is now tilted {degrees} degrees from vertical.)"
+    );
 
     let flat_page = make_flat_page(fw, fh);
-    let flat_corners: [(f32, f32); 4] = [(0.0, 0.0), (fw as f32 - 1.0, 0.0), (fw as f32 - 1.0, fh as f32 - 1.0), (0.0, fh as f32 - 1.0)];
+    let flat_corners: [(f32, f32); 4] = [
+        (0.0, 0.0),
+        (fw as f32 - 1.0, 0.0),
+        (fw as f32 - 1.0, fh as f32 - 1.0),
+        (0.0, fh as f32 - 1.0),
+    ];
     let projection = Projection::from_control_points(flat_corners, quad_f32).expect("projection");
 
     let mut warped_page: RgbImage = ImageBuffer::new(pw, ph);
-    warp_into(&flat_page, projection, Interpolation::Bilinear, Border::Constant(Rgb([0, 0, 0])), &mut warped_page);
+    warp_into(
+        &flat_page,
+        projection,
+        Interpolation::Bilinear,
+        Border::Constant(Rgb([0, 0, 0])),
+        &mut warped_page,
+    );
 
     let flat_mask: GrayImage = ImageBuffer::from_pixel(fw, fh, Luma([255]));
     let mut mask_photo: GrayImage = ImageBuffer::new(pw, ph);
-    warp_into(&flat_mask, projection, Interpolation::Nearest, Border::Constant(Luma([0])), &mut mask_photo);
+    warp_into(
+        &flat_mask,
+        projection,
+        Interpolation::Nearest,
+        Border::Constant(Luma([0])),
+        &mut mask_photo,
+    );
 
     for y in 0..ph {
         for x in 0..pw {
@@ -127,7 +163,8 @@ fn main() {
 fn encode_heic(img: &RgbImage, path: &Path) -> windows::core::Result<()> {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        let factory: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+        let factory: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
         let stream = factory.CreateStream()?;
         let wide = to_wide(path);
         stream.InitializeFromFilename(PCWSTR(wide.as_ptr()), GENERIC_WRITE.0)?;
@@ -142,9 +179,22 @@ fn encode_heic(img: &RgbImage, path: &Path) -> windows::core::Result<()> {
         let mut format = GUID_WICPixelFormat24bppRGB;
         frame.SetPixelFormat(&mut format)?;
         let stride = img.width() * 3;
-        let source_bitmap = factory.CreateBitmapFromMemory(img.width(), img.height(), &GUID_WICPixelFormat24bppRGB, stride, img.as_raw())?;
+        let source_bitmap = factory.CreateBitmapFromMemory(
+            img.width(),
+            img.height(),
+            &GUID_WICPixelFormat24bppRGB,
+            stride,
+            img.as_raw(),
+        )?;
         let converter: IWICFormatConverter = factory.CreateFormatConverter()?;
-        converter.Initialize(&source_bitmap, &format, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom)?;
+        converter.Initialize(
+            &source_bitmap,
+            &format,
+            WICBitmapDitherTypeNone,
+            None,
+            0.0,
+            WICBitmapPaletteTypeCustom,
+        )?;
         frame.WriteSource(&converter, std::ptr::null())?;
         frame.Commit()?;
         encoder.Commit()?;

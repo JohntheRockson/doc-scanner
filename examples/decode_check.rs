@@ -16,11 +16,16 @@ use windows::Win32::Graphics::Imaging::{
     IWICFormatConverter, IWICImagingFactory, WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom,
     WICDecodeMetadataCacheOnDemand,
 };
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx};
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+};
 use windows::core::PCWSTR;
 
 fn to_wide(path: &Path) -> Vec<u16> {
-    path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 fn read_orientation(frame: &IWICBitmapFrameDecode) -> u32 {
@@ -58,9 +63,15 @@ fn read_orientation(frame: &IWICBitmapFrameDecode) -> u32 {
 
 fn decode(path: &Path) -> windows::core::Result<(RgbaImage, u32)> {
     unsafe {
-        let factory: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+        let factory: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
         let wide = to_wide(path);
-        let decoder = factory.CreateDecoderFromFilename(PCWSTR(wide.as_ptr()), None, GENERIC_READ, WICDecodeMetadataCacheOnDemand)?;
+        let decoder = factory.CreateDecoderFromFilename(
+            PCWSTR(wide.as_ptr()),
+            None,
+            GENERIC_READ,
+            WICDecodeMetadataCacheOnDemand,
+        )?;
         let frame = decoder.GetFrame(0)?;
 
         let orientation = read_orientation(&frame);
@@ -71,7 +82,14 @@ fn decode(path: &Path) -> windows::core::Result<(RgbaImage, u32)> {
         println!("  raw WIC size: {width}x{height}");
 
         let converter: IWICFormatConverter = factory.CreateFormatConverter()?;
-        converter.Initialize(&frame, &GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom)?;
+        converter.Initialize(
+            &frame,
+            &GUID_WICPixelFormat32bppRGBA,
+            WICBitmapDitherTypeNone,
+            None,
+            0.0,
+            WICBitmapPaletteTypeCustom,
+        )?;
 
         let stride = width * 4;
         let mut buffer = vec![0u8; (stride * height) as usize];
@@ -101,16 +119,25 @@ fn main() {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     }
     let mut args = env::args().skip(1);
-    let input = args.next().expect("usage: decode_check <file.heic> [out.png]");
+    let input = args
+        .next()
+        .expect("usage: decode_check <file.heic> [out.png]");
     let input = Path::new(&input);
-    let output: PathBuf = args.next().map(PathBuf::from).unwrap_or_else(|| input.with_extension("decoded.png"));
+    let output: PathBuf = args
+        .next()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| input.with_extension("decoded.png"));
 
     println!("{}", input.display());
     match decode(input) {
         Ok((img, orientation)) => {
             println!("  detected EXIF orientation tag value: {orientation}");
             let final_img = apply_orientation(img, orientation);
-            println!("  final size after orientation correction: {}x{}", final_img.width(), final_img.height());
+            println!(
+                "  final size after orientation correction: {}x{}",
+                final_img.width(),
+                final_img.height()
+            );
             final_img.save(&output).expect("save png");
             println!("  wrote {}", output.display());
         }

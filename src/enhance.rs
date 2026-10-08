@@ -59,7 +59,8 @@ fn remove_shading(img: &RgbImage) -> RgbImage {
     let small = image::imageops::resize(img, sw, sh, image::imageops::FilterType::Triangle);
     let sigma = (sw.min(sh) as f32 / 5.0).max(6.0);
     let shading_small = gaussian_blur_f32(&small, sigma);
-    let shading = image::imageops::resize(&shading_small, w, h, image::imageops::FilterType::Triangle);
+    let shading =
+        image::imageops::resize(&shading_small, w, h, image::imageops::FilterType::Triangle);
 
     let mut out: RgbImage = ImageBuffer::new(w, h);
     for y in 0..h {

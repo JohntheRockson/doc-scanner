@@ -38,9 +38,18 @@ async fn run() {
             .send()
             .await
             .expect("download");
-        let bytes = resp.body.collect().await.expect("collect body").into_bytes();
+        let bytes = resp
+            .body
+            .collect()
+            .await
+            .expect("collect body")
+            .into_bytes();
         let out = PathBuf::from("test_assets/bugcheck").join(&key);
         std::fs::write(&out, &bytes).expect("write file");
-        println!("Downloaded {key} ({} bytes) -> {}", bytes.len(), out.display());
+        println!(
+            "Downloaded {key} ({} bytes) -> {}",
+            bytes.len(),
+            out.display()
+        );
     }
 }

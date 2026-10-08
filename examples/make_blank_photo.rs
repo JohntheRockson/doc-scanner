@@ -16,11 +16,16 @@ use windows::Win32::Graphics::Imaging::{
     WICBitmapEncoderNoCache, WICBitmapPaletteTypeCustom,
 };
 use windows::Win32::System::Com::StructuredStorage::IPropertyBag2;
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx};
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+};
 use windows::core::PCWSTR;
 
 fn to_wide(path: &Path) -> Vec<u16> {
-    path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 struct Lcg(u32);
@@ -47,7 +52,8 @@ fn make_blank_photo() -> RgbImage {
 fn encode_heic(img: &RgbImage, path: &Path) -> windows::core::Result<()> {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        let factory: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+        let factory: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
         let stream = factory.CreateStream()?;
         let wide = to_wide(path);
         stream.InitializeFromFilename(PCWSTR(wide.as_ptr()), GENERIC_WRITE.0)?;
@@ -62,9 +68,22 @@ fn encode_heic(img: &RgbImage, path: &Path) -> windows::core::Result<()> {
         let mut format = GUID_WICPixelFormat24bppRGB;
         frame.SetPixelFormat(&mut format)?;
         let stride = img.width() * 3;
-        let source_bitmap = factory.CreateBitmapFromMemory(img.width(), img.height(), &GUID_WICPixelFormat24bppRGB, stride, img.as_raw())?;
+        let source_bitmap = factory.CreateBitmapFromMemory(
+            img.width(),
+            img.height(),
+            &GUID_WICPixelFormat24bppRGB,
+            stride,
+            img.as_raw(),
+        )?;
         let converter: IWICFormatConverter = factory.CreateFormatConverter()?;
-        converter.Initialize(&source_bitmap, &format, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom)?;
+        converter.Initialize(
+            &source_bitmap,
+            &format,
+            WICBitmapDitherTypeNone,
+            None,
+            0.0,
+            WICBitmapPaletteTypeCustom,
+        )?;
         frame.WriteSource(&converter, std::ptr::null())?;
         frame.Commit()?;
         encoder.Commit()?;
@@ -73,7 +92,10 @@ fn encode_heic(img: &RgbImage, path: &Path) -> windows::core::Result<()> {
 }
 
 fn main() {
-    let out: PathBuf = env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("test_assets/blank.heic"));
+    let out: PathBuf = env::args()
+        .nth(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("test_assets/blank.heic"));
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent).expect("create output dir");
     }

@@ -10,6 +10,9 @@ use std::path::PathBuf;
 /// from the bucket once they're safely in the PDF. Pass `--local` to scan local files
 /// instead - either the default OneDrive Camera Roll (including its dated `YYYY\MM`
 /// subfolders), or specific files/folders you name.
+///
+/// Pass `--edit` or `-edit` to place screenshots, images, and text on the scan
+/// before the PDF is saved.
 #[derive(Parser, Debug)]
 #[command(name = "paper_scanner", version, about, long_about = None)]
 pub struct Args {
@@ -74,4 +77,50 @@ pub struct Args {
     /// directory, one pair per input photo. Handy for tuning/troubleshooting detection.
     #[arg(long)]
     pub debug: Option<PathBuf>,
+
+    /// After scanning, open an editor to paste screenshots (Ctrl+V), place
+    /// PNG/JPEG images, and add text boxes before the PDF is written.
+    /// `-edit` is accepted as well as `--edit`.
+    #[arg(long)]
+    pub edit: bool,
+}
+
+/// Rewrites the single-dash form `-edit` into clap's `--edit`.
+///
+/// The rest of this CLI uses clap's usual `--long` / `-s` forms. `-edit` is
+/// accepted too because that's the flag name used when invoking the tool.
+pub fn normalize_args<I, T>(args: I) -> Vec<std::ffi::OsString>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString>,
+{
+    args.into_iter()
+        .map(|arg| {
+            let arg = arg.into();
+            if arg == "-edit" { "--edit".into() } else { arg }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Args, normalize_args};
+    use clap::Parser;
+
+    #[test]
+    fn edit_flag_accepts_single_and_double_dash() {
+        let from_long = Args::parse_from(["paper_scanner", "--edit", "page.heic"]);
+        assert!(from_long.edit);
+        assert_eq!(from_long.items, ["page.heic"]);
+
+        let from_short = Args::parse_from(normalize_args([
+            "paper_scanner",
+            "-edit",
+            "--local",
+            "page.heic",
+        ]));
+        assert!(from_short.edit);
+        assert!(from_short.local);
+        assert_eq!(from_short.items, ["page.heic"]);
+    }
 }

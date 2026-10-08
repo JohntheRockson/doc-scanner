@@ -33,8 +33,7 @@
 //!    the raw heuristic, and this is what corrects the >45-degree-tilt case from step 5.
 
 use crate::geometry::{
-    Pt, clamp_to_bounds, convex_hull, expand_quad, extreme_corners, polygon_area,
-    quad_output_size,
+    Pt, clamp_to_bounds, convex_hull, expand_quad, extreme_corners, polygon_area, quad_output_size,
 };
 use image::{GrayImage, Luma, RgbImage};
 use imageproc::contours::{BorderType, find_contours};
@@ -88,12 +87,7 @@ pub fn detect_paper(img: &RgbImage) -> Detection {
     );
 
     let small = if scale < 1.0 {
-        image::imageops::resize(
-            img,
-            small_w,
-            small_h,
-            image::imageops::FilterType::Triangle,
-        )
+        image::imageops::resize(img, small_w, small_h, image::imageops::FilterType::Triangle)
     } else {
         img.clone()
     };
@@ -197,7 +191,11 @@ fn candidate_hulls(gray: &GrayImage) -> Vec<(Vec<Pt>, f64)> {
 
     for bright_foreground in [true, false] {
         if let Some(c) = find_paper_hull(gray, |v| {
-            if bright_foreground { v > otsu } else { v <= otsu }
+            if bright_foreground {
+                v > otsu
+            } else {
+                v <= otsu
+            }
         }) {
             candidates.push(c);
         }
@@ -379,7 +377,8 @@ mod orientation_tests {
         let corrected = match_photo_orientation(labeled, 850, 1100);
         let mut original_sorted = labeled.to_vec();
         let mut corrected_sorted = corrected.to_vec();
-        let key = |p: &Pt| (p.x * 1000.0).round() as i64 * 10_000_000 + (p.y * 1000.0).round() as i64;
+        let key =
+            |p: &Pt| (p.x * 1000.0).round() as i64 * 10_000_000 + (p.y * 1000.0).round() as i64;
         original_sorted.sort_by_key(key);
         corrected_sorted.sort_by_key(key);
         for (a, b) in original_sorted.iter().zip(corrected_sorted.iter()) {

@@ -89,9 +89,7 @@ pub fn decode_image(path: &Path) -> Result<RgbaImage> {
             )
             .context("could not convert the decoded image to RGBA")?;
 
-        let stride = width
-            .checked_mul(4)
-            .context("image is implausibly wide")?;
+        let stride = width.checked_mul(4).context("image is implausibly wide")?;
         let buffer_len = (stride as u64) * (height as u64);
         let mut buffer = vec![0u8; buffer_len as usize];
         converter

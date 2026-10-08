@@ -7,8 +7,8 @@
 //! of the program stays fully synchronous; only these calls run on a small Tokio runtime.
 
 use anyhow::{Context, Result};
-use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::Client;
+use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use std::time::SystemTime;
 
 /// R2 credentials/config, read from the process environment (populated from `.env` at
@@ -40,13 +40,8 @@ impl R2Config {
 }
 
 pub fn build_client(cfg: &R2Config) -> Client {
-    let credentials = Credentials::new(
-        &cfg.access_key_id,
-        &cfg.secret_key,
-        None,
-        None,
-        "r2-static",
-    );
+    let credentials =
+        Credentials::new(&cfg.access_key_id, &cfg.secret_key, None, None, "r2-static");
     let config = aws_sdk_s3::Config::builder()
         .behavior_version(BehaviorVersion::latest())
         .endpoint_url(&cfg.endpoint)

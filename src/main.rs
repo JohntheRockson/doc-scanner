@@ -1,5 +1,6 @@
 mod cli;
 mod detect;
+mod editor;
 mod enhance;
 mod geometry;
 mod heic;
@@ -24,7 +25,7 @@ fn main() -> Result<()> {
     // Non-fatal if missing: local mode needs no Cloudflare config at all.
     let _ = dotenvy::dotenv();
 
-    let args = Args::parse();
+    let args = Args::parse_from(cli::normalize_args(std::env::args_os()));
     heic::init_com();
 
     if is_local_mode(&args) {
@@ -39,6 +40,26 @@ fn main() -> Result<()> {
 /// without having to remember a new flag.
 fn is_local_mode(args: &Args) -> bool {
     args.local || args.items.iter().any(|s| Path::new(s).exists())
+}
+
+/// Scans are unchanged without `--edit`. With the flag, the page images open in
+/// the editor first and whatever comes back (screenshots, images, text) is what
+/// gets written into the PDF.
+fn open_editor_if_requested(
+    edit: bool,
+    pages: Vec<RgbImage>,
+    output: &Path,
+) -> Result<Vec<RgbImage>> {
+    if !edit {
+        return Ok(pages);
+    }
+    println!(
+        "Opening the editor window.\n\
+         Ctrl+V pastes a screenshot onto the page. You can also add a PNG/JPEG or a text box.\n\
+         Save PDF, or close the window, to write:\n  {}",
+        output.display()
+    );
+    editor::run(pages, output)
 }
 
 // ================================ Local filesystem mode =================================
@@ -95,6 +116,7 @@ fn run_local(args: &Args) -> Result<()> {
     }
 
     let output_path = resolve_output(&args.output, &args.name)?;
+    let pages = open_editor_if_requested(args.edit, pages, &output_path)?;
     pdf::write_pdf(&pages, &output_path)?;
 
     println!(
@@ -208,7 +230,11 @@ fn run_remote(args: &Args) -> Result<()> {
     let rt = tokio::runtime::Runtime::new().context("starting the async runtime for R2 access")?;
 
     let mut objects = rt
-        .block_on(r2::list_objects(&client, &cfg.bucket, args.prefix.as_deref()))
+        .block_on(r2::list_objects(
+            &client,
+            &cfg.bucket,
+            args.prefix.as_deref(),
+        ))
         .with_context(|| format!("connecting to R2 bucket '{}'", cfg.bucket))?;
     objects.sort_by(|a, b| a.key.cmp(&b.key));
 
@@ -247,7 +273,10 @@ fn run_remote(args: &Args) -> Result<()> {
     // Explicitly-named items are always processed regardless of age, same as local mode.
     // With no selection, Cloudflare mode defaults to "everything in the bucket" - only
     // apply a time filter if the user actually asked for one.
-    if args.items.is_empty() && !args.all && let Some(minutes) = args.minutes {
+    if args.items.is_empty()
+        && !args.all
+        && let Some(minutes) = args.minutes
+    {
         let now = SystemTime::now();
         let window = Duration::from_secs(minutes.saturating_mul(60));
         selected.retain(|o| object_is_recent(o, window, now));
@@ -311,6 +340,7 @@ fn run_remote(args: &Args) -> Result<()> {
     }
 
     let output_path = resolve_output(&args.output, &args.name)?;
+    let pages = open_editor_if_requested(args.edit, pages, &output_path)?;
     pdf::write_pdf(&pages, &output_path)?;
 
     println!(
@@ -336,7 +366,9 @@ fn run_remote(args: &Args) -> Result<()> {
         if failures == 0 {
             println!("Done - the R2 bucket is clear of the scanned photos.");
         } else {
-            println!("Done, but {failures} file(s) could not be deleted from R2 (see warnings above).");
+            println!(
+                "Done, but {failures} file(s) could not be deleted from R2 (see warnings above)."
+            );
         }
     }
 
@@ -372,7 +404,10 @@ fn select_remote_objects(
 
 fn object_is_recent(obj: &r2::RemoteObject, window: Duration, now: SystemTime) -> bool {
     match obj.last_modified {
-        Some(t) => now.duration_since(t).map(|age| age <= window).unwrap_or(true),
+        Some(t) => now
+            .duration_since(t)
+            .map(|age| age <= window)
+            .unwrap_or(true),
         None => true,
     }
 }
@@ -411,7 +446,11 @@ fn format_time(t: Option<SystemTime>) -> String {
 /// Decodes, detects the paper, perspective-corrects, and cleans up shading for one photo.
 /// Used identically whether the file came from disk or was just downloaded from R2.
 fn process_one(path: &Path, mode: ScanMode, debug_dir: &Option<PathBuf>) -> Result<RgbImage> {
-    let file_label = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let file_label = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
     println!("Processing {file_label}...");
 
     let rgba = heic::decode_image(path).with_context(|| format!("decoding {}", path.display()))?;
@@ -500,10 +539,12 @@ fn trim_dark_borders(img: &RgbImage) -> RgbImage {
     const PAPER_COVERAGE: f64 = 0.42;
 
     let row_is_paper = |y: u32| {
-        bright_fraction((0..w).map(|x| pixel_luma(img.get_pixel(x, y))), PAPER_LUMA) >= PAPER_COVERAGE
+        bright_fraction((0..w).map(|x| pixel_luma(img.get_pixel(x, y))), PAPER_LUMA)
+            >= PAPER_COVERAGE
     };
     let col_is_paper = |x: u32| {
-        bright_fraction((0..h).map(|y| pixel_luma(img.get_pixel(x, y))), PAPER_LUMA) >= PAPER_COVERAGE
+        bright_fraction((0..h).map(|y| pixel_luma(img.get_pixel(x, y))), PAPER_LUMA)
+            >= PAPER_COVERAGE
     };
 
     let mut top = 0u32;
@@ -602,7 +643,10 @@ fn is_recent(meta: &std::fs::Metadata, window: Duration, now: SystemTime) -> boo
     match newest_timestamp(meta) {
         // If we can't read either timestamp, err on the side of including the file
         // rather than silently dropping a photo the user expected to see scanned.
-        Some(t) => now.duration_since(t).map(|age| age <= window).unwrap_or(true),
+        Some(t) => now
+            .duration_since(t)
+            .map(|age| age <= window)
+            .unwrap_or(true),
         None => true,
     }
 }
@@ -611,7 +655,12 @@ fn is_recent(meta: &std::fs::Metadata, window: Duration, now: SystemTime) -> boo
 /// baked into typical iPhone filenames (`YYYYMMDD_HHMMSS`). OneDrive's archive step can
 /// leave a file in `2026\09` whose mtime doesn't match when it was actually taken, and
 /// those filenames are often UTC, so we accept either local or UTC interpretation.
-fn is_recent_photo(path: &Path, meta: &std::fs::Metadata, window: Duration, now: SystemTime) -> bool {
+fn is_recent_photo(
+    path: &Path,
+    meta: &std::fs::Metadata,
+    window: Duration,
+    now: SystemTime,
+) -> bool {
     if is_recent(meta, window, now) {
         return true;
     }
@@ -625,8 +674,8 @@ fn filename_is_recent(name: &str, window: Duration, now: SystemTime) -> bool {
     let Some((year, month, day, hour, min, sec)) = filename_datetime_parts(name) else {
         return false;
     };
-    let Some(naive) = NaiveDate::from_ymd_opt(year, month, day)
-        .and_then(|d| d.and_hms_opt(hour, min, sec))
+    let Some(naive) =
+        NaiveDate::from_ymd_opt(year, month, day).and_then(|d| d.and_hms_opt(hour, min, sec))
     else {
         return false;
     };
@@ -707,7 +756,11 @@ fn resolve_output(output: &Option<PathBuf>, name: &Option<String>) -> Result<Pat
     };
 
     let resolved = match output {
-        Some(p) if p.extension().map(|e| e.eq_ignore_ascii_case("pdf")).unwrap_or(false) => {
+        Some(p)
+            if p.extension()
+                .map(|e| e.eq_ignore_ascii_case("pdf"))
+                .unwrap_or(false) =>
+        {
             if name.is_some() {
                 eprintln!(
                     "Note: --output already names a file ('{}'), ignoring --name.",

@@ -14,19 +14,29 @@ use windows::Win32::Foundation::GENERIC_READ;
 use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, IWICImagingFactory, WICDecodeMetadataCacheOnDemand,
 };
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx};
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+};
 use windows::core::PCWSTR;
 
 fn to_wide(path: &Path) -> Vec<u16> {
-    path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
-fn try_read_orientation(frame: &windows::Win32::Graphics::Imaging::IWICBitmapFrameDecode) -> Vec<(String, String)> {
+fn try_read_orientation(
+    frame: &windows::Win32::Graphics::Imaging::IWICBitmapFrameDecode,
+) -> Vec<(String, String)> {
     use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
     use windows::core::w;
 
     let candidates: &[(&str, windows::core::PCWSTR)] = &[
-        ("/app1/ifd/exif/{ushort=274}", w!("/app1/ifd/exif/{ushort=274}")),
+        (
+            "/app1/ifd/exif/{ushort=274}",
+            w!("/app1/ifd/exif/{ushort=274}"),
+        ),
         ("/ifd/exif/{ushort=274}", w!("/ifd/exif/{ushort=274}")),
         ("/ifd/{ushort=274}", w!("/ifd/{ushort=274}")),
         ("/xmp/tiff:Orientation", w!("/xmp/tiff:Orientation")),
@@ -48,7 +58,13 @@ fn try_read_orientation(frame: &windows::Win32::Graphics::Imaging::IWICBitmapFra
             match reader.GetMetadataByName(*name, &mut prop) {
                 Ok(()) => {
                     let vt = prop.Anonymous.Anonymous.vt;
-                    results.push((label.to_string(), format!("OK vt={vt:?} uiVal={}", prop.Anonymous.Anonymous.Anonymous.uiVal)));
+                    results.push((
+                        label.to_string(),
+                        format!(
+                            "OK vt={vt:?} uiVal={}",
+                            prop.Anonymous.Anonymous.Anonymous.uiVal
+                        ),
+                    ));
                 }
                 Err(e) => {
                     results.push((label.to_string(), format!("not found ({e})")));
@@ -61,7 +77,8 @@ fn try_read_orientation(frame: &windows::Win32::Graphics::Imaging::IWICBitmapFra
 
 fn inspect(path: &Path) -> windows::core::Result<()> {
     unsafe {
-        let factory: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+        let factory: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
         let wide = to_wide(path);
         let decoder = factory.CreateDecoderFromFilename(
             PCWSTR(wide.as_ptr()),
@@ -78,7 +95,13 @@ fn inspect(path: &Path) -> windows::core::Result<()> {
         println!("{}", path.display());
         println!(
             "  RAW decoded size from WIC: {width} x {height}  ({})",
-            if width > height { "landscape" } else if height > width { "portrait" } else { "square" }
+            if width > height {
+                "landscape"
+            } else if height > width {
+                "portrait"
+            } else {
+                "square"
+            }
         );
 
         for (label, result) in try_read_orientation(&frame) {
