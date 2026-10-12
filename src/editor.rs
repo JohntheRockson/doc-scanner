@@ -1,8 +1,8 @@
 //! Editor opened by `--edit` / `-edit` after a scan.
 //!
 //! Page coordinates are pixels of the scanned image. The window only scales
-//! that image to fit; screenshots and text are stored in those pixels and
-//! burned in when the window closes, so the PDF matches what was on the page.
+//! that image to fit; screenshots, text, and ink are stored in those pixels
+//! and burned in when the window closes, so the PDF matches the page.
 
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use anyhow::{Context, Result};
@@ -29,7 +29,7 @@ pub fn run(pages: Vec<RgbImage>, output: &Path) -> Result<Vec<RgbImage>> {
     let hint = output.display().to_string();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Scan editor — Ctrl+V pastes a screenshot")
+            .with_title("Scan editor")
             .with_inner_size(egui::vec2(1360.0, 900.0))
             .with_min_inner_size(egui::vec2(960.0, 640.0))
             .with_drag_and_drop(true),
@@ -56,7 +56,20 @@ struct EditorApp {
     pages: Vec<Page>,
     page_idx: usize,
     selected: Option<usize>,
+    tool: Tool,
+    /// RGB swatch. Alpha is applied when a stroke is created.
+    color: [u8; 4],
+    /// Pen and eraser thickness, in points on a letter-sized page.
+    pen_pt: f32,
+    highlight_pt: f32,
     drag: Drag,
+    /// Stroke currently being drawn, in page pixels. Committed on release.
+    live: Option<LiveStroke>,
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    /// True after this gesture has already stored one undo snapshot.
+    gesture_undo: bool,
+    slider_undo: bool,
     zoom: f32,
     pan: egui::Vec2,
     /// Page-pixels to screen-points, from the last drawn frame. Used so arrow
@@ -81,6 +94,7 @@ struct Page {
     items: Vec<Item>,
 }
 
+#[derive(Clone)]
 struct Item {
     x: f32,
     y: f32,
@@ -90,9 +104,10 @@ struct Item {
     kind: Kind,
 }
 
+#[derive(Clone)]
 enum Kind {
     Image {
-        source: RgbaImage,
+        source: Arc<RgbaImage>,
         texture: egui::TextureHandle,
         /// height / width of `source`, so resizing keeps the picture's shape.
         aspect: f32,
@@ -100,10 +115,61 @@ enum Kind {
     Text {
         text: String,
         size: f32,
-        raster: RgbaImage,
+        color: [u8; 4],
+        raster: Arc<RgbaImage>,
         texture: Option<egui::TextureHandle>,
     },
+    /// `points` are relative to `Item::x` / `Item::y`. `width` is the stroke
+    /// diameter in page pixels.
+    Ink {
+        points: Vec<(f32, f32)>,
+        color: [u8; 4],
+        width: f32,
+        highlighter: bool,
+    },
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LayerTo {
+    Front,
+    Back,
+    /// One step toward the viewer. Higher indexes are drawn later, so they sit in front.
+    Forward,
+    Backward,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tool {
+    Select,
+    Pen,
+    Highlighter,
+    Eraser,
+}
+
+struct LiveStroke {
+    points: Vec<(f32, f32)>,
+    color: [u8; 4],
+    width: f32,
+    highlighter: bool,
+}
+
+struct Snapshot {
+    page: usize,
+    items: Vec<Item>,
+}
+
+const PALETTE: [[u8; 4]; 10] = [
+    [23, 23, 23, 255],
+    [98, 98, 98, 255],
+    [220, 38, 38, 255],
+    [234, 88, 12, 255],
+    [234, 179, 8, 255],
+    [22, 163, 74, 255],
+    [37, 99, 235, 255],
+    [124, 58, 237, 255],
+    [219, 39, 119, 255],
+    [255, 255, 255, 255],
+];
 
 #[derive(Clone, Copy)]
 enum Drag {
@@ -119,6 +185,8 @@ enum Drag {
     Pan {
         last: egui::Pos2,
     },
+    Draw,
+    Erase,
 }
 
 #[derive(Clone, Copy)]
@@ -137,7 +205,8 @@ impl EditorApp {
     ) -> Self {
         let ctx = &cc.egui_ctx;
         let font = load_font();
-        let mut status = "Copy a screenshot and press Ctrl+V to drop it on the page.".to_string();
+        let mut status =
+            "Select to move things, or press P and draw. Ctrl+V pastes a screenshot.".to_string();
         if font.is_none() {
             status = "No system font found, so text boxes are disabled. Screenshots and images still work.".into();
         }
@@ -158,7 +227,16 @@ impl EditorApp {
             pages,
             page_idx: 0,
             selected: None,
+            tool: Tool::Select,
+            color: PALETTE[0],
+            pen_pt: 2.4,
+            highlight_pt: 18.0,
             drag: Drag::None,
+            live: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            gesture_undo: false,
+            slider_undo: false,
             zoom: 1.0,
             pan: egui::Vec2::ZERO,
             view_scale: 1.0,
@@ -179,14 +257,87 @@ impl EditorApp {
         self.handle_drops(ui.ctx());
 
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
+        egui::Panel::left("tools")
+            .resizable(false)
+            .exact_size(188.0)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| self.tools(ui));
+            });
         egui::Panel::right("props")
             .resizable(true)
             .min_size(240.0)
-            .default_size(300.0)
+            .default_size(280.0)
             .max_size(420.0)
             .show(ui, |ui| self.props(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
         egui::CentralPanel::default().show(ui, |ui| self.canvas(ui));
+    }
+
+    fn tools(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Tools").strong());
+        ui.add_space(4.0);
+        self.tool_button(ui, Tool::Select, "Select", "V");
+        self.tool_button(ui, Tool::Pen, "Pen", "P");
+        self.tool_button(ui, Tool::Highlighter, "Highlight", "H");
+        self.tool_button(ui, Tool::Eraser, "Eraser", "E");
+
+        ui.add_space(12.0);
+        ui.label(egui::RichText::new("Colors").strong());
+        ui.add_space(4.0);
+        let chosen = self.color;
+        let mut picked = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+            for color in PALETTE {
+                if color_swatch(ui, color, same_rgb(color, chosen)).clicked() {
+                    picked = Some(color);
+                }
+            }
+        });
+        if let Some(color) = picked {
+            self.set_color(color);
+        }
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("Keys 1–9 and 0 pick a color")
+                .weak()
+                .small(),
+        );
+
+        ui.add_space(10.0);
+        let highlight = self.editing_highlighter();
+        let (label, mut value, range) = if highlight {
+            ("Highlight", self.highlight_pt, 8.0..=32.0)
+        } else if self.tool == Tool::Eraser {
+            ("Eraser", self.pen_pt, 0.8..=10.0)
+        } else {
+            ("Thickness", self.pen_pt, 0.8..=10.0)
+        };
+        let response = ui.add(egui::Slider::new(&mut value, range).text(label));
+        if response.changed() {
+            self.set_thickness(value);
+        }
+        ui.label(
+            egui::RichText::new("[ and ] change thickness")
+                .weak()
+                .small(),
+        );
+    }
+
+    fn tool_button(&mut self, ui: &mut egui::Ui, tool: Tool, name: &str, key: &str) {
+        let on = self.tool == tool;
+        let label = if on {
+            egui::RichText::new(format!("{name}   {key}")).color(egui::Color32::WHITE)
+        } else {
+            egui::RichText::new(format!("{name}   {key}"))
+        };
+        let mut button = egui::Button::new(label);
+        if on {
+            button = button.fill(egui::Color32::from_rgb(37, 99, 235));
+        }
+        if ui.add_sized([ui.available_width(), 30.0], button).clicked() {
+            self.set_tool(tool);
+        }
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
@@ -211,18 +362,19 @@ impl EditorApp {
             }
             ui.separator();
             if ui
-                .button("Add image…")
+                .button("Image")
                 .on_hover_text("Place a PNG or JPEG on this page")
                 .clicked()
             {
                 self.pick_images(ui.ctx());
             }
             if ui
-                .add_enabled(self.font.is_some(), egui::Button::new("Add text"))
-                .on_hover_text("Drop a text box on this page")
+                .add_enabled(self.font.is_some(), egui::Button::new("Text"))
+                .on_hover_text("Drop a text box on this page (T)")
                 .clicked()
             {
                 self.add_text(None, ui.ctx());
+                self.set_tool(Tool::Select);
             }
             if ui
                 .button("Paste")
@@ -233,11 +385,26 @@ impl EditorApp {
             }
             ui.separator();
             if ui
+                .add_enabled(!self.undo.is_empty(), egui::Button::new("Undo"))
+                .on_hover_text("Ctrl+Z")
+                .clicked()
+            {
+                self.undo_edit();
+            }
+            if ui
+                .add_enabled(!self.redo.is_empty(), egui::Button::new("Redo"))
+                .on_hover_text("Ctrl+Y")
+                .clicked()
+            {
+                self.redo_edit();
+            }
+            if ui
                 .add_enabled(self.selected.is_some(), egui::Button::new("Delete"))
                 .clicked()
             {
                 self.delete_selected();
             }
+            ui.separator();
             if ui
                 .button("Fit")
                 .on_hover_text("Fit the page in the window")
@@ -256,32 +423,15 @@ impl EditorApp {
                 self.finish(ui.ctx());
             }
         });
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(
-                    "Ctrl+V pastes a screenshot · drag to move · blue corner resizes · scroll zooms · drag the page background to pan",
-                )
-                .weak()
-                .small(),
-            )
-            .wrap_mode(egui::TextWrapMode::Wrap),
-        );
     }
 
     fn props(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Selection");
+        ui.label(egui::RichText::new("Selection").strong());
         ui.separator();
 
         let Some(index) = self.selected else {
             self.text_edit_id = None;
-            ui.label("Nothing selected.");
-            ui.add_space(8.0);
-            ui.add(
-                egui::Label::new(
-                    "Press Ctrl+V to paste a screenshot, or use Add image / Add text.",
-                )
-                .wrap_mode(egui::TextWrapMode::Wrap),
-            );
+            ui.add(egui::Label::new(self.tool_help()).wrap_mode(egui::TextWrapMode::Wrap));
             return;
         };
         if index >= self.pages[self.page_idx].items.len() {
@@ -290,69 +440,147 @@ impl EditorApp {
             return;
         }
 
-        let is_text = matches!(
-            self.pages[self.page_idx].items[index].kind,
-            Kind::Text { .. }
-        );
-
-        if is_text {
-            let (mut text, mut size) = match &self.pages[self.page_idx].items[index].kind {
-                Kind::Text { text, size, .. } => (text.clone(), *size),
-                Kind::Image { .. } => (String::new(), 32.0),
-            };
-            let response = ui.add(
-                egui::TextEdit::multiline(&mut text)
-                    .id(egui::Id::new(("anno-text", self.page_idx, index)))
-                    .desired_rows(8)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("Type here"),
-            );
-            self.text_edit_id = Some(response.id);
-            if self.focus_text {
-                response.request_focus();
-                self.focus_text = false;
-            }
-            let (_, page_h) = self.page_px();
-            let max_size = (page_h / 10.0).clamp(72.0, 280.0);
-            ui.add(egui::Slider::new(&mut size, 18.0..=max_size).text("Font size"));
-            ui.add(
-                egui::Label::new("Drag the blue corner to change how wide the text wraps.")
+        match &self.pages[self.page_idx].items[index].kind {
+            Kind::Text { .. } => self.props_text(ui, index),
+            Kind::Image { .. } => self.props_image(ui, index),
+            Kind::Ink { highlighter, .. } => {
+                self.text_edit_id = None;
+                ui.label(if *highlighter {
+                    "Highlighter stroke"
+                } else {
+                    "Pen stroke"
+                });
+                ui.add_space(6.0);
+                ui.add(
+                    egui::Label::new(
+                        "Drag it to move. The color palette and thickness slider edit this stroke.",
+                    )
                     .wrap_mode(egui::TextWrapMode::Wrap),
-            );
-
-            let item = &mut self.pages[self.page_idx].items[index];
-            if let Kind::Text {
-                text: stored,
-                size: stored_size,
-                ..
-            } = &mut item.kind
-            {
-                if *stored != text {
-                    *stored = text;
-                    item.dirty = true;
-                }
-                let size = size.round();
-                if (*stored_size - size).abs() > 0.1 {
-                    *stored_size = size;
-                    item.dirty = true;
-                }
+                );
             }
-        } else {
-            self.text_edit_id = None;
-            let (w, h) = {
-                let item = &self.pages[self.page_idx].items[index];
-                (item.w, item.h)
-            };
-            ui.label(format!("{w:.0} × {h:.0} px on the page"));
-            ui.add(
-                egui::Label::new("Drag the image to move it. Drag the blue corner to resize. The picture keeps its shape.")
-                    .wrap_mode(egui::TextWrapMode::Wrap),
-            );
         }
 
         ui.add_space(12.0);
+        self.layer_controls(ui, index);
+        ui.add_space(8.0);
         if ui.button("Delete").clicked() {
             self.delete_selected();
+        }
+    }
+
+    fn layer_controls(&mut self, ui: &mut egui::Ui, index: usize) {
+        let len = self.pages[self.page_idx].items.len();
+        ui.label(egui::RichText::new("Layer").strong());
+        ui.label(
+            egui::RichText::new(format!("{} of {len}  ·  higher is in front", index + 1))
+                .weak()
+                .small(),
+        );
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(index + 1 < len, egui::Button::new("To front"))
+                .on_hover_text("Bring in front of everything (Ctrl+Shift+Up)")
+                .clicked()
+            {
+                self.reorder_selected(LayerTo::Front);
+            }
+            if ui
+                .add_enabled(index + 1 < len, egui::Button::new("Forward"))
+                .on_hover_text("Move up one layer (Ctrl+Up)")
+                .clicked()
+            {
+                self.reorder_selected(LayerTo::Forward);
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(index > 0, egui::Button::new("To back"))
+                .on_hover_text("Send behind everything (Ctrl+Shift+Down)")
+                .clicked()
+            {
+                self.reorder_selected(LayerTo::Back);
+            }
+            if ui
+                .add_enabled(index > 0, egui::Button::new("Backward"))
+                .on_hover_text("Move down one layer (Ctrl+Down)")
+                .clicked()
+            {
+                self.reorder_selected(LayerTo::Backward);
+            }
+        });
+    }
+
+    fn props_text(&mut self, ui: &mut egui::Ui, index: usize) {
+        let (mut text, mut size) = match &self.pages[self.page_idx].items[index].kind {
+            Kind::Text { text, size, .. } => (text.clone(), *size),
+            _ => return,
+        };
+        let response = ui.add(
+            egui::TextEdit::multiline(&mut text)
+                .id(egui::Id::new(("anno-text", self.page_idx, index)))
+                .desired_rows(8)
+                .desired_width(f32::INFINITY)
+                .hint_text("Type here"),
+        );
+        self.text_edit_id = Some(response.id);
+        if self.focus_text {
+            response.request_focus();
+            self.focus_text = false;
+        }
+        let (_, page_h) = self.page_px();
+        let max_size = (page_h / 10.0).clamp(72.0, 280.0);
+        ui.add(egui::Slider::new(&mut size, 18.0..=max_size).text("Font size"));
+        ui.add(
+            egui::Label::new(
+                "Color comes from the palette. Drag the corner to set the wrap width.",
+            )
+            .wrap_mode(egui::TextWrapMode::Wrap),
+        );
+
+        let item = &mut self.pages[self.page_idx].items[index];
+        if let Kind::Text {
+            text: stored,
+            size: stored_size,
+            ..
+        } = &mut item.kind
+        {
+            if *stored != text {
+                *stored = text;
+                item.dirty = true;
+            }
+            let size = size.round();
+            if (*stored_size - size).abs() > 0.1 {
+                *stored_size = size;
+                item.dirty = true;
+            }
+        }
+    }
+
+    fn props_image(&mut self, ui: &mut egui::Ui, index: usize) {
+        self.text_edit_id = None;
+        let (w, h) = {
+            let item = &self.pages[self.page_idx].items[index];
+            (item.w, item.h)
+        };
+        ui.label(format!("{w:.0} × {h:.0} px on the page"));
+        ui.add(
+            egui::Label::new(
+                "Drag the image to move it. Drag the blue corner to resize. The picture keeps its shape.",
+            )
+            .wrap_mode(egui::TextWrapMode::Wrap),
+        );
+    }
+
+    fn tool_help(&self) -> &'static str {
+        match self.tool {
+            Tool::Select => {
+                "Nothing selected. Drag an item to move it, or press P to draw. Ctrl+V pastes a screenshot."
+            }
+            Tool::Pen => "Pen is on. Draw on the page. Right-drag pans, scroll zooms.",
+            Tool::Highlighter => "Highlighter is on. Drag across the words you want to mark.",
+            Tool::Eraser => {
+                "Eraser removes pen and highlighter strokes. It leaves the scan, text, and pictures."
+            }
         }
     }
 
@@ -476,7 +704,12 @@ impl EditorApp {
         }
 
         if !any_down {
+            if matches!(self.drag, Drag::Draw) {
+                self.commit_live_stroke();
+            }
             self.drag = Drag::None;
+            self.gesture_undo = false;
+            self.slider_undo = false;
         }
 
         if any_down {
@@ -486,26 +719,36 @@ impl EditorApp {
             {
                 let pos = hover.unwrap();
                 let (page_x, page_y) = to_page(pos, geom);
-                let on_handle = self
-                    .selected
-                    .is_some_and(|index| self.handle_contains(index, pos, geom));
-                if on_handle {
-                    let index = self.selected.unwrap();
-                    self.drag = Drag::Resize { index };
-                } else if let Some(hit) = self.hit_test(page_x, page_y) {
-                    let index = self.bring_to_front(hit);
-                    self.selected = Some(index);
-                    self.focus_text = false;
-                    let item = &self.pages[self.page_idx].items[index];
-                    self.drag = Drag::Move {
-                        index,
-                        grab_x: page_x - item.x,
-                        grab_y: page_y - item.y,
-                    };
-                } else {
-                    self.selected = None;
-                    self.focus_text = false;
-                    self.drag = Drag::Pan { last: pos };
+                match self.tool {
+                    Tool::Pen | Tool::Highlighter if geom.page_rect.contains(pos) => {
+                        self.start_stroke(page_x, page_y);
+                    }
+                    Tool::Eraser if geom.page_rect.contains(pos) => {
+                        self.drag = Drag::Erase;
+                        self.erase_at(page_x, page_y);
+                    }
+                    Tool::Select | Tool::Pen | Tool::Highlighter | Tool::Eraser => {
+                        let on_handle = self
+                            .selected
+                            .is_some_and(|index| self.handle_contains(index, pos, geom));
+                        if on_handle {
+                            let index = self.selected.unwrap();
+                            self.drag = Drag::Resize { index };
+                        } else if let Some(hit) = self.hit_test(page_x, page_y) {
+                            self.selected = Some(hit);
+                            self.focus_text = false;
+                            let item = &self.pages[self.page_idx].items[hit];
+                            self.drag = Drag::Move {
+                                index: hit,
+                                grab_x: page_x - item.x,
+                                grab_y: page_y - item.y,
+                            };
+                        } else {
+                            self.selected = None;
+                            self.focus_text = false;
+                            self.drag = Drag::Pan { last: pos };
+                        }
+                    }
                 }
             } else if (secondary_pressed || middle_pressed)
                 && hover.is_some_and(|pos| canvas.contains(pos))
@@ -521,7 +764,11 @@ impl EditorApp {
             }
         }
 
-        if matches!(self.drag, Drag::Move { .. }) {
+        if matches!(self.tool, Tool::Pen | Tool::Highlighter | Tool::Eraser)
+            && !matches!(self.drag, Drag::Pan { .. })
+        {
+            ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+        } else if matches!(self.drag, Drag::Move { .. }) {
             ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
         } else if matches!(self.drag, Drag::Resize { .. }) {
             ctx.set_cursor_icon(egui::CursorIcon::ResizeNwSe);
@@ -548,11 +795,19 @@ impl EditorApp {
                 grab_x,
                 grab_y,
             } => {
-                if let Some(item) = self.pages[self.page_idx].items.get_mut(index) {
-                    let (x, y) =
-                        keep_on_page(page_x - grab_x, page_y - grab_y, item.w, item.h, pw, ph);
-                    item.x = x;
-                    item.y = y;
+                let Some(item) = self.pages[self.page_idx].items.get(index) else {
+                    return;
+                };
+                let (x, y) = keep_on_page(page_x - grab_x, page_y - grab_y, item.w, item.h, pw, ph);
+                if (x - item.x).abs() > 0.2 || (y - item.y).abs() > 0.2 {
+                    if !self.gesture_undo {
+                        self.push_undo();
+                        self.gesture_undo = true;
+                    }
+                    if let Some(item) = self.pages[self.page_idx].items.get_mut(index) {
+                        item.x = x;
+                        item.y = y;
+                    }
                 }
             }
             Drag::Resize { index } => self.resize_item(index, page_x, pw, ph),
@@ -560,6 +815,13 @@ impl EditorApp {
                 self.pan += pos - last;
                 self.drag = Drag::Pan { last: pos };
             }
+            Drag::Draw => {
+                if let Some(live) = &mut self.live {
+                    let min = (live.width * 0.28).max(0.75);
+                    extend_stroke(&mut live.points, page_x, page_y, min);
+                }
+            }
+            Drag::Erase => self.erase_at(page_x, page_y),
             Drag::None => {}
         }
     }
@@ -583,6 +845,7 @@ impl EditorApp {
                     item.dirty = true;
                 }
             }
+            Kind::Ink { .. } => {}
         }
     }
 
@@ -613,23 +876,36 @@ impl EditorApp {
         for item in &self.pages[self.page_idx].items {
             draw_item(&item_painter, item, geom, uv);
         }
+        if let Some(live) = &self.live {
+            draw_page_stroke(painter, &live.points, live.color, live.width, geom);
+        }
         if let Some(index) = self.selected {
             if let Some(item) = self.pages[self.page_idx].items.get(index) {
                 let rect = item_screen_rect(item, geom.origin, geom.scale);
+                let ink = matches!(item.kind, Kind::Ink { .. });
                 painter.rect_stroke(
                     rect,
                     0.0,
                     egui::Stroke::new(2.0, egui::Color32::from_rgb(47, 111, 235)),
                     egui::StrokeKind::Outside,
                 );
-                let handle = handle_screen_rect(rect);
-                painter.rect_filled(handle, 2.0, egui::Color32::WHITE);
-                painter.rect_stroke(
-                    handle,
-                    2.0,
-                    egui::Stroke::new(2.0, egui::Color32::from_rgb(47, 111, 235)),
-                    egui::StrokeKind::Inside,
-                );
+                if !ink {
+                    let handle = handle_screen_rect(rect);
+                    painter.rect_filled(handle, 2.0, egui::Color32::WHITE);
+                    painter.rect_stroke(
+                        handle,
+                        2.0,
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(47, 111, 235)),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+            }
+        }
+        if matches!(self.tool, Tool::Pen | Tool::Highlighter | Tool::Eraser) {
+            if let Some((x, y)) = self.hover_page {
+                let center = geom.origin + egui::vec2(x, y) * geom.scale;
+                let radius = (self.tool_width_px() * 0.5 * geom.scale).max(2.0);
+                painter.circle_stroke(center, radius, egui::Stroke::new(1.5, egui::Color32::WHITE));
             }
         }
     }
@@ -655,6 +931,41 @@ impl EditorApp {
             });
         }
 
+        if command && !typing && pressed_once(ctx, egui::Key::Z) {
+            if shift {
+                self.redo_edit();
+            } else {
+                self.undo_edit();
+            }
+        }
+        if command && !typing && pressed_once(ctx, egui::Key::Y) {
+            self.redo_edit();
+        }
+
+        if !typing && !command {
+            if pressed_once(ctx, egui::Key::P) {
+                self.set_tool(Tool::Pen);
+            } else if pressed_once(ctx, egui::Key::H) {
+                self.set_tool(Tool::Highlighter);
+            } else if pressed_once(ctx, egui::Key::E) {
+                self.set_tool(Tool::Eraser);
+            } else if pressed_once(ctx, egui::Key::V) {
+                self.set_tool(Tool::Select);
+            } else if pressed_once(ctx, egui::Key::T) {
+                self.add_text(None, ctx);
+                self.set_tool(Tool::Select);
+            }
+            if let Some(color) = palette_key(ctx) {
+                self.set_color(color);
+            }
+            if pressed_once(ctx, egui::Key::OpenBracket) {
+                self.bump_thickness(-0.4);
+            }
+            if pressed_once(ctx, egui::Key::CloseBracket) {
+                self.bump_thickness(0.4);
+            }
+        }
+
         if !typing {
             if ctx
                 .input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
@@ -666,22 +977,39 @@ impl EditorApp {
                 self.selected = None;
             }
 
-            let mut dx = 0.0;
-            let mut dy = 0.0;
-            if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
-                dx -= 1.0;
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
-                dx += 1.0;
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
-                dy -= 1.0;
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
-                dy += 1.0;
-            }
-            if dx != 0.0 || dy != 0.0 {
-                self.nudge_selected(dx, dy, shift);
+            if command && self.selected.is_some() {
+                if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                    self.reorder_selected(if shift {
+                        LayerTo::Front
+                    } else {
+                        LayerTo::Forward
+                    });
+                }
+                if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                    self.reorder_selected(if shift {
+                        LayerTo::Back
+                    } else {
+                        LayerTo::Backward
+                    });
+                }
+            } else {
+                let mut dx = 0.0;
+                let mut dy = 0.0;
+                if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+                    dx -= 1.0;
+                }
+                if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+                    dx += 1.0;
+                }
+                if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                    dy -= 1.0;
+                }
+                if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                    dy += 1.0;
+                }
+                if dx != 0.0 || dy != 0.0 {
+                    self.nudge_selected(dx, dy, shift);
+                }
             }
 
             if ctx.input(|i| i.key_pressed(egui::Key::Equals) || i.key_pressed(egui::Key::Plus)) {
@@ -798,6 +1126,8 @@ impl EditorApp {
         let (x, y) = place_centered(pw, ph, w, h, self.hover_page, nudge);
         let texture = upload_rgba(ctx, &img, "stamp");
         let aspect = ih as f32 / iw as f32;
+        self.push_undo();
+        self.set_tool(Tool::Select);
         self.pages[self.page_idx].items.push(Item {
             x,
             y,
@@ -805,7 +1135,7 @@ impl EditorApp {
             h,
             dirty: false,
             kind: Kind::Image {
-                source: img,
+                source: Arc::new(img),
                 texture,
                 aspect,
             },
@@ -828,6 +1158,9 @@ impl EditorApp {
         let (x, y) = place_top_left(pw, ph, w, h, self.hover_page, nudge);
         let text = text.unwrap_or_default();
         let dirty = !text.trim().is_empty();
+        let mut color = self.color;
+        color[3] = 255;
+        self.push_undo();
         self.pages[self.page_idx].items.push(Item {
             x,
             y,
@@ -837,7 +1170,8 @@ impl EditorApp {
             kind: Kind::Text {
                 text,
                 size,
-                raster: RgbaImage::new(1, 1),
+                color,
+                raster: Arc::new(RgbaImage::new(1, 1)),
                 texture: None,
             },
         });
@@ -857,9 +1191,9 @@ impl EditorApp {
         let Some(index) = self.selected else {
             return;
         };
-        let items = &mut self.pages[self.page_idx].items;
-        if index < items.len() {
-            items.remove(index);
+        if index < self.pages[self.page_idx].items.len() {
+            self.push_undo();
+            self.pages[self.page_idx].items.remove(index);
         }
         self.selected = None;
         self.focus_text = false;
@@ -880,16 +1214,27 @@ impl EditorApp {
         self.zoom = 1.0;
         self.pan = egui::Vec2::ZERO;
         self.hover_page = None;
+        self.live = None;
     }
 
-    fn bring_to_front(&mut self, index: usize) -> usize {
-        let items = &mut self.pages[self.page_idx].items;
-        if index >= items.len() || index + 1 == items.len() {
-            return index.min(items.len().saturating_sub(1));
-        }
-        let item = items.remove(index);
-        items.push(item);
-        items.len() - 1
+    fn reorder_selected(&mut self, to: LayerTo) {
+        let Some(index) = self.selected else {
+            return;
+        };
+        let len = self.pages[self.page_idx].items.len();
+        let Some(dest) = layer_destination(index, len, to) else {
+            return;
+        };
+        self.push_undo();
+        let item = self.pages[self.page_idx].items.remove(index);
+        self.pages[self.page_idx].items.insert(dest, item);
+        self.selected = Some(dest);
+        self.status = match to {
+            LayerTo::Front => "Brought to front.".into(),
+            LayerTo::Back => "Sent to back.".into(),
+            LayerTo::Forward => "Moved forward one layer.".into(),
+            LayerTo::Backward => "Moved backward one layer.".into(),
+        };
     }
 
     fn hit_test(&self, page_x: f32, page_y: f32) -> Option<usize> {
@@ -898,12 +1243,7 @@ impl EditorApp {
             .iter()
             .enumerate()
             .rev()
-            .find(|(_, item)| {
-                page_x >= item.x
-                    && page_y >= item.y
-                    && page_x <= item.x + item.w
-                    && page_y <= item.y + item.h
-            })
+            .find(|(_, item)| item_contains(item, page_x, page_y))
             .map(|(index, _)| index)
     }
 
@@ -911,6 +1251,9 @@ impl EditorApp {
         let Some(item) = self.pages[self.page_idx].items.get(index) else {
             return false;
         };
+        if matches!(item.kind, Kind::Ink { .. }) {
+            return false;
+        }
         let rect = item_screen_rect(item, geom.origin, geom.scale);
         handle_screen_rect(rect).contains(pos)
     }
@@ -929,9 +1272,11 @@ impl EditorApp {
             if !item.dirty {
                 continue;
             }
-            let (text, size) = match &item.kind {
-                Kind::Text { text, size, .. } => (text.clone(), *size),
-                Kind::Image { .. } => {
+            let (text, size, color) = match &item.kind {
+                Kind::Text {
+                    text, size, color, ..
+                } => (text.clone(), *size, *color),
+                Kind::Image { .. } | Kind::Ink { .. } => {
                     item.dirty = false;
                     continue;
                 }
@@ -943,22 +1288,354 @@ impl EditorApp {
                     raster, texture, ..
                 } = &mut item.kind
                 {
-                    *raster = RgbaImage::new(1, 1);
+                    *raster = Arc::new(RgbaImage::new(1, 1));
                     *texture = None;
                 }
                 continue;
             }
-            let image = rasterize_text(&font, &text, size, item.w);
+            let image = rasterize_text(&font, &text, size, item.w, color);
             item.h = image.height() as f32;
             let handle = upload_rgba(ctx, &image, "text");
             if let Kind::Text {
                 raster, texture, ..
             } = &mut item.kind
             {
-                *raster = image;
+                *raster = Arc::new(image);
                 *texture = Some(handle);
             }
         }
+    }
+
+    fn set_tool(&mut self, tool: Tool) {
+        if self.tool == tool {
+            return;
+        }
+        self.tool = tool;
+        self.live = None;
+        if !matches!(self.drag, Drag::None) && !matches!(tool, Tool::Select) {
+            self.drag = Drag::None;
+        }
+        self.status = self.tool_help().to_string();
+    }
+
+    fn set_color(&mut self, color: [u8; 4]) {
+        if same_rgb(self.color, color) {
+            return;
+        }
+        if self.selected_accepts_color() {
+            self.push_undo();
+        }
+        self.color = color;
+        self.apply_color_to_selected();
+    }
+
+    fn editing_highlighter(&self) -> bool {
+        if self.tool == Tool::Highlighter {
+            return true;
+        }
+        self.selected_ink_highlighter() == Some(true) && self.tool == Tool::Select
+    }
+
+    fn selected_ink_highlighter(&self) -> Option<bool> {
+        let index = self.selected?;
+        match self.pages[self.page_idx]
+            .items
+            .get(index)
+            .map(|item| &item.kind)
+        {
+            Some(Kind::Ink { highlighter, .. }) => Some(*highlighter),
+            _ => None,
+        }
+    }
+
+    fn set_thickness(&mut self, pt: f32) {
+        let highlight = self.editing_highlighter();
+        let pt = if highlight {
+            pt.clamp(8.0, 32.0)
+        } else {
+            pt.clamp(0.8, 10.0)
+        };
+        let old = if highlight {
+            self.highlight_pt
+        } else {
+            self.pen_pt
+        };
+        if (old - pt).abs() < 0.05 {
+            return;
+        }
+        let can_restyle = self.selected_ink_highlighter() == Some(highlight);
+        if can_restyle && !self.slider_undo {
+            self.push_undo();
+            self.slider_undo = true;
+        }
+        if highlight {
+            self.highlight_pt = pt;
+        } else {
+            self.pen_pt = pt;
+        }
+        if can_restyle {
+            if let Some(index) = self.selected_ink() {
+                self.set_ink_width(index, self.pt_to_px(pt));
+            }
+        }
+    }
+
+    fn bump_thickness(&mut self, delta: f32) {
+        let next = match self.tool {
+            Tool::Highlighter => self.highlight_pt + delta * 2.0,
+            _ => self.pen_pt + delta,
+        };
+        self.set_thickness(next);
+    }
+
+    fn selected_accepts_color(&self) -> bool {
+        self.selected
+            .and_then(|index| self.pages[self.page_idx].items.get(index))
+            .is_some_and(|item| matches!(item.kind, Kind::Text { .. } | Kind::Ink { .. }))
+    }
+
+    fn selected_ink(&self) -> Option<usize> {
+        self.selected.filter(|index| {
+            self.pages[self.page_idx]
+                .items
+                .get(*index)
+                .is_some_and(|item| matches!(item.kind, Kind::Ink { .. }))
+        })
+    }
+
+    fn apply_color_to_selected(&mut self) {
+        let Some(index) = self.selected else {
+            return;
+        };
+        let rgb = self.color;
+        let Some(item) = self.pages[self.page_idx].items.get_mut(index) else {
+            return;
+        };
+        match &mut item.kind {
+            Kind::Text { color, .. } => {
+                let next = [rgb[0], rgb[1], rgb[2], 255];
+                if *color != next {
+                    *color = next;
+                    item.dirty = true;
+                }
+            }
+            Kind::Ink {
+                color, highlighter, ..
+            } => {
+                *color = [rgb[0], rgb[1], rgb[2], if *highlighter { 120 } else { 255 }];
+            }
+            Kind::Image { .. } => {}
+        }
+    }
+
+    fn set_ink_width(&mut self, index: usize, width: f32) {
+        let Some(item) = self.pages[self.page_idx].items.get_mut(index) else {
+            return;
+        };
+        let Kind::Ink {
+            points,
+            color,
+            highlighter,
+            ..
+        } = &item.kind
+        else {
+            return;
+        };
+        let page_points: Vec<(f32, f32)> = points
+            .iter()
+            .map(|(x, y)| (item.x + x, item.y + y))
+            .collect();
+        let color = *color;
+        let highlighter = *highlighter;
+        let replacement = make_ink_item(page_points, color, width, highlighter);
+        self.pages[self.page_idx].items[index] = replacement;
+    }
+
+    fn tool_width_px(&self) -> f32 {
+        let pt = match self.tool {
+            Tool::Highlighter => self.highlight_pt,
+            Tool::Eraser => (self.pen_pt * 4.5).clamp(3.0, 36.0),
+            _ => self.pen_pt,
+        };
+        self.pt_to_px(pt)
+    }
+
+    fn pt_to_px(&self, pt: f32) -> f32 {
+        let (_, page_h) = self.page_px();
+        (pt * page_h / 792.0).clamp(1.4, page_h * 0.2)
+    }
+
+    fn start_stroke(&mut self, x: f32, y: f32) {
+        let highlighter = self.tool == Tool::Highlighter;
+        let mut color = self.color;
+        color[3] = if highlighter { 120 } else { 255 };
+        let width = self.pt_to_px(if highlighter {
+            self.highlight_pt
+        } else {
+            self.pen_pt
+        });
+        self.selected = None;
+        self.focus_text = false;
+        self.live = Some(LiveStroke {
+            points: vec![(x, y)],
+            color,
+            width,
+            highlighter,
+        });
+        self.drag = Drag::Draw;
+    }
+
+    fn commit_live_stroke(&mut self) {
+        let Some(mut live) = self.live.take() else {
+            return;
+        };
+        if let Some((x, y)) = self.hover_page {
+            extend_stroke(&mut live.points, x, y, 0.4);
+        }
+        if live.points.is_empty() {
+            return;
+        }
+        self.push_undo();
+        let item = make_ink_item(live.points, live.color, live.width, live.highlighter);
+        self.pages[self.page_idx].items.push(item);
+        self.selected = Some(self.pages[self.page_idx].items.len() - 1);
+        self.status = "Stroke added. Press V to move it.".into();
+    }
+
+    fn erase_at(&mut self, x: f32, y: f32) {
+        let radius = self.tool_width_px();
+        if !self.ink_hit(x, y, radius) {
+            return;
+        }
+        if !self.gesture_undo {
+            self.push_undo();
+            self.gesture_undo = true;
+        }
+        self.selected = None;
+        let items = std::mem::take(&mut self.pages[self.page_idx].items);
+        let mut next = Vec::with_capacity(items.len());
+        for item in items {
+            let Item {
+                x: item_x,
+                y: item_y,
+                w,
+                h,
+                dirty,
+                kind,
+            } = item;
+            let Kind::Ink {
+                points,
+                color,
+                width,
+                highlighter,
+            } = kind
+            else {
+                next.push(Item {
+                    x: item_x,
+                    y: item_y,
+                    w,
+                    h,
+                    dirty,
+                    kind,
+                });
+                continue;
+            };
+            let page_points: Vec<(f32, f32)> = points
+                .iter()
+                .map(|(px, py)| (px + item_x, py + item_y))
+                .collect();
+            let reach = radius + width * 0.45;
+            let runs = split_stroke(&page_points, x, y, reach);
+            if runs.len() == 1 && runs[0].len() == page_points.len() {
+                next.push(Item {
+                    x: item_x,
+                    y: item_y,
+                    w,
+                    h,
+                    dirty,
+                    kind: Kind::Ink {
+                        points,
+                        color,
+                        width,
+                        highlighter,
+                    },
+                });
+            } else {
+                for run in runs {
+                    next.push(make_ink_item(run, color, width, highlighter));
+                }
+            }
+        }
+        self.pages[self.page_idx].items = next;
+        self.status = "Erased.".into();
+    }
+
+    fn ink_hit(&self, x: f32, y: f32, radius: f32) -> bool {
+        self.pages[self.page_idx].items.iter().any(|item| {
+            let Kind::Ink { points, width, .. } = &item.kind else {
+                return false;
+            };
+            let reach = radius + width * 0.45;
+            points.iter().any(|(px, py)| {
+                let dx = x - (item.x + px);
+                let dy = y - (item.y + py);
+                dx * dx + dy * dy <= reach * reach
+            }) || points.windows(2).any(|pair| {
+                dist_point_seg(
+                    x,
+                    y,
+                    item.x + pair[0].0,
+                    item.y + pair[0].1,
+                    item.x + pair[1].0,
+                    item.y + pair[1].1,
+                ) <= reach
+            })
+        })
+    }
+
+    fn push_undo(&mut self) {
+        let page = self.page_idx;
+        let items = self.pages[page].items.clone();
+        self.undo.push(Snapshot { page, items });
+        self.redo.clear();
+        if self.undo.len() > 30 {
+            self.undo.remove(0);
+        }
+    }
+
+    fn undo_edit(&mut self) {
+        let Some(snapshot) = self.undo.pop() else {
+            self.status = "Nothing to undo.".into();
+            return;
+        };
+        self.store_redo(snapshot.page);
+        self.pages[snapshot.page].items = snapshot.items;
+        self.page_idx = snapshot.page;
+        self.selected = None;
+        self.live = None;
+        self.status = "Undid the last change.".into();
+    }
+
+    fn redo_edit(&mut self) {
+        let Some(snapshot) = self.redo.pop() else {
+            self.status = "Nothing to redo.".into();
+            return;
+        };
+        let page = snapshot.page;
+        let current = std::mem::take(&mut self.pages[page].items);
+        self.undo.push(Snapshot {
+            page,
+            items: current,
+        });
+        self.pages[page].items = snapshot.items;
+        self.page_idx = page;
+        self.selected = None;
+        self.status = "Redid the change.".into();
+    }
+
+    fn store_redo(&mut self, page: usize) {
+        let items = self.pages[page].items.clone();
+        self.redo.push(Snapshot { page, items });
     }
 
     fn finish(&mut self, ctx: &egui::Context) {
@@ -1007,6 +1684,18 @@ fn draw_item(painter: &egui::Painter, item: &Item, geom: ViewGeom, uv: egui::Rec
         Kind::Image { texture, .. } => {
             let rect = item_screen_rect(item, geom.origin, geom.scale);
             painter.image(texture.id(), rect, uv, egui::Color32::WHITE);
+        }
+        Kind::Ink {
+            points,
+            color,
+            width,
+            ..
+        } => {
+            let page_points: Vec<(f32, f32)> = points
+                .iter()
+                .map(|(x, y)| (item.x + x, item.y + y))
+                .collect();
+            draw_page_stroke(painter, &page_points, *color, *width, geom);
         }
         Kind::Text {
             text,
@@ -1071,6 +1760,7 @@ fn item_is_visible(item: &Item) -> bool {
     match &item.kind {
         Kind::Image { .. } => true,
         Kind::Text { text, .. } => !text.trim().is_empty(),
+        Kind::Ink { points, .. } => !points.is_empty(),
     }
 }
 
@@ -1108,10 +1798,31 @@ fn stamps_from(items: &[Item]) -> Vec<Stamp> {
                     None
                 } else {
                     Some(Stamp {
-                        image: raster.clone(),
+                        image: (**raster).clone(),
                         x: item.x.round() as i64,
                         y: item.y.round() as i64,
                     })
+                }
+            }
+            Kind::Ink {
+                points,
+                color,
+                width,
+                ..
+            } => {
+                if points.is_empty() {
+                    None
+                } else {
+                    let image = rasterize_ink(item.w, item.h, points, *width, *color);
+                    if image.pixels().all(|pixel| pixel[3] == 0) {
+                        None
+                    } else {
+                        Some(Stamp {
+                            image,
+                            x: item.x.round() as i64,
+                            y: item.y.round() as i64,
+                        })
+                    }
                 }
             }
         })
@@ -1448,7 +2159,13 @@ fn split_word(font: &FontArc, size: f32, word: &str, max_width: f32) -> Vec<Stri
     parts
 }
 
-fn rasterize_text(font: &FontArc, text: &str, size: f32, max_width: f32) -> RgbaImage {
+fn rasterize_text(
+    font: &FontArc,
+    text: &str,
+    size: f32,
+    max_width: f32,
+    color: [u8; 4],
+) -> RgbaImage {
     let size = size.clamp(8.0, 400.0);
     let max_width = max_width.clamp(8.0, 8000.0);
     let line_h = line_box_height(font, size);
@@ -1463,7 +2180,7 @@ fn rasterize_text(font: &FontArc, text: &str, size: f32, max_width: f32) -> Rgba
         if y >= height as f32 {
             break;
         }
-        draw_text_line(&mut image, font, size, 0.0, y, line);
+        draw_text_line(&mut image, font, size, 0.0, y, line, color);
     }
     image
 }
@@ -1475,6 +2192,7 @@ fn draw_text_line(
     x: f32,
     y_top: f32,
     text: &str,
+    color: [u8; 4],
 ) {
     let scale = PxScale::from(size.max(8.0));
     let scaled = font.as_scaled(scale);
@@ -1502,7 +2220,7 @@ fn draw_text_line(
                 if px >= image.width() || py >= image.height() {
                     return;
                 }
-                blend_coverage(image.get_pixel_mut(px, py), coverage);
+                blend_coverage(image.get_pixel_mut(px, py), coverage, color);
             });
         }
         caret += scaled.h_advance(id);
@@ -1510,15 +2228,307 @@ fn draw_text_line(
     }
 }
 
-fn blend_coverage(dst: &mut Rgba<u8>, coverage: f32) {
-    let alpha = coverage.clamp(0.0, 1.0);
+fn color_swatch(ui: &mut egui::Ui, color: [u8; 4], selected: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        painter.circle_filled(rect.center(), 10.0, color32(color));
+        let ring = if selected {
+            egui::Stroke::new(2.5, egui::Color32::from_rgb(37, 99, 235))
+        } else if color[0] > 240 && color[1] > 240 && color[2] > 240 {
+            egui::Stroke::new(1.0, egui::Color32::from_gray(160))
+        } else {
+            egui::Stroke::new(1.0, egui::Color32::from_black_alpha(30))
+        };
+        painter.circle_stroke(rect.center(), if selected { 12.0 } else { 10.0 }, ring);
+    }
+    response
+}
+
+fn same_rgb(a: [u8; 4], b: [u8; 4]) -> bool {
+    a[0] == b[0] && a[1] == b[1] && a[2] == b[2]
+}
+
+fn palette_key(ctx: &egui::Context) -> Option<[u8; 4]> {
+    const KEYS: [egui::Key; 10] = [
+        egui::Key::Num1,
+        egui::Key::Num2,
+        egui::Key::Num3,
+        egui::Key::Num4,
+        egui::Key::Num5,
+        egui::Key::Num6,
+        egui::Key::Num7,
+        egui::Key::Num8,
+        egui::Key::Num9,
+        egui::Key::Num0,
+    ];
+    KEYS.iter()
+        .position(|key| pressed_once(ctx, *key))
+        .map(|index| PALETTE[index])
+}
+
+fn color32(color: [u8; 4]) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3])
+}
+
+fn extend_stroke(points: &mut Vec<(f32, f32)>, x: f32, y: f32, min_dist: f32) {
+    if let Some(&(px, py)) = points.last() {
+        let dx = x - px;
+        let dy = y - py;
+        if dx * dx + dy * dy < min_dist * min_dist {
+            return;
+        }
+    }
+    points.push((x, y));
+}
+
+fn draw_page_stroke(
+    painter: &egui::Painter,
+    points: &[(f32, f32)],
+    color: [u8; 4],
+    width: f32,
+    geom: ViewGeom,
+) {
+    if points.is_empty() {
+        return;
+    }
+    let radius = (width * 0.5 * geom.scale).max(0.6);
+    let paint = color32(color);
+    let mut previous = None;
+    for &(x, y) in points {
+        let at = geom.origin + egui::vec2(x, y) * geom.scale;
+        if let Some(from) = previous {
+            painter.line_segment([from, at], egui::Stroke::new(radius * 2.0, paint));
+        }
+        painter.circle_filled(at, radius, paint);
+        previous = Some(at);
+    }
+}
+
+fn item_contains(item: &Item, page_x: f32, page_y: f32) -> bool {
+    match &item.kind {
+        Kind::Ink { points, width, .. } => {
+            let reach = width * 0.5 + 6.0;
+            let near_point = points.iter().any(|(x, y)| {
+                let dx = page_x - (item.x + x);
+                let dy = page_y - (item.y + y);
+                dx * dx + dy * dy <= reach * reach
+            });
+            near_point
+                || points.windows(2).any(|pair| {
+                    dist_point_seg(
+                        page_x,
+                        page_y,
+                        item.x + pair[0].0,
+                        item.y + pair[0].1,
+                        item.x + pair[1].0,
+                        item.y + pair[1].1,
+                    ) <= reach
+                })
+        }
+        _ => {
+            page_x >= item.x
+                && page_y >= item.y
+                && page_x <= item.x + item.w
+                && page_y <= item.y + item.h
+        }
+    }
+}
+
+fn make_ink_item(points: Vec<(f32, f32)>, color: [u8; 4], width: f32, highlighter: bool) -> Item {
+    let (x, y, w, h, local) = normalize_ink(&points, width);
+    Item {
+        x,
+        y,
+        w,
+        h,
+        dirty: false,
+        kind: Kind::Ink {
+            points: local,
+            color,
+            width,
+            highlighter,
+        },
+    }
+}
+
+fn normalize_ink(points: &[(f32, f32)], width: f32) -> (f32, f32, f32, f32, Vec<(f32, f32)>) {
+    let pad = width * 0.5 + 2.0;
+    let min_x = points.iter().map(|point| point.0).fold(f32::MAX, f32::min) - pad;
+    let min_y = points.iter().map(|point| point.1).fold(f32::MAX, f32::min) - pad;
+    let max_x = points.iter().map(|point| point.0).fold(f32::MIN, f32::max) + pad;
+    let max_y = points.iter().map(|point| point.1).fold(f32::MIN, f32::max) + pad;
+    let local = points.iter().map(|(x, y)| (x - min_x, y - min_y)).collect();
+    (
+        min_x,
+        min_y,
+        (max_x - min_x).max(1.0),
+        (max_y - min_y).max(1.0),
+        local,
+    )
+}
+
+fn rasterize_ink(
+    width: f32,
+    height: f32,
+    points: &[(f32, f32)],
+    stroke: f32,
+    color: [u8; 4],
+) -> RgbaImage {
+    let w = width.round().clamp(1.0, 8000.0) as u32;
+    let h = height.round().clamp(1.0, 8000.0) as u32;
+    let mut cover = vec![0u8; (w as usize) * (h as usize)];
+    let radius = (stroke * 0.5).max(0.6);
+    if points.len() == 1 {
+        stamp_disc(&mut cover, w, h, points[0].0, points[0].1, radius);
+    } else {
+        for pair in points.windows(2) {
+            stamp_segment(
+                &mut cover, w, h, pair[0].0, pair[0].1, pair[1].0, pair[1].1, radius,
+            );
+        }
+    }
+    let mut image = RgbaImage::new(w, h);
+    for (index, coverage) in cover.into_iter().enumerate() {
+        if coverage == 0 {
+            continue;
+        }
+        let alpha = ((color[3] as u16 * coverage as u16) / 255) as u8;
+        if alpha == 0 {
+            continue;
+        }
+        let x = (index as u32) % w;
+        let y = (index as u32) / w;
+        image.put_pixel(x, y, Rgba([color[0], color[1], color[2], alpha]));
+    }
+    image
+}
+
+fn stamp_segment(
+    cover: &mut [u8],
+    w: u32,
+    h: u32,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    radius: f32,
+) {
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    let len = (dx * dx + dy * dy).sqrt();
+    let step = (radius * 0.45).max(0.45);
+    let steps = (len / step).ceil().max(1.0) as i32;
+    for step_index in 0..=steps {
+        let t = step_index as f32 / steps as f32;
+        stamp_disc(cover, w, h, x0 + dx * t, y0 + dy * t, radius);
+    }
+}
+
+fn stamp_disc(cover: &mut [u8], w: u32, h: u32, cx: f32, cy: f32, radius: f32) {
+    let reach = radius.ceil() as i32 + 1;
+    let x_start = (cx as i32 - reach).max(0);
+    let y_start = (cy as i32 - reach).max(0);
+    let x_end = (cx as i32 + reach).min(w as i32 - 1);
+    let y_end = (cy as i32 + reach).min(h as i32 - 1);
+    for y in y_start..=y_end {
+        for x in x_start..=x_end {
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+            let edge = (radius + 0.65 - dist).clamp(0.0, 1.0);
+            if edge <= 0.0 {
+                continue;
+            }
+            let value = (edge * 255.0) as u8;
+            let index = (y as u32 * w + x as u32) as usize;
+            if value > cover[index] {
+                cover[index] = value;
+            }
+        }
+    }
+}
+
+fn split_stroke(points: &[(f32, f32)], cx: f32, cy: f32, radius: f32) -> Vec<Vec<(f32, f32)>> {
+    if points.is_empty() {
+        return Vec::new();
+    }
+    let mut dead = vec![false; points.len()];
+    for (index, &(x, y)) in points.iter().enumerate() {
+        if dist(x, y, cx, cy) <= radius {
+            dead[index] = true;
+        }
+    }
+    for index in 0..points.len().saturating_sub(1) {
+        if dist_point_seg(
+            cx,
+            cy,
+            points[index].0,
+            points[index].1,
+            points[index + 1].0,
+            points[index + 1].1,
+        ) <= radius
+        {
+            dead[index] = true;
+            dead[index + 1] = true;
+        }
+    }
+    let mut runs = Vec::new();
+    let mut current = Vec::new();
+    for (index, point) in points.iter().enumerate() {
+        if dead[index] {
+            if !current.is_empty() {
+                runs.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(*point);
+        }
+    }
+    if !current.is_empty() {
+        runs.push(current);
+    }
+    runs
+}
+
+/// Where `index` should land in a list of `len` items. `None` when it is already there.
+fn layer_destination(index: usize, len: usize, to: LayerTo) -> Option<usize> {
+    if len < 2 || index >= len {
+        return None;
+    }
+    let dest = match to {
+        LayerTo::Front => len - 1,
+        LayerTo::Back => 0,
+        LayerTo::Forward => (index + 1).min(len - 1),
+        LayerTo::Backward => index.saturating_sub(1),
+    };
+    (dest != index).then_some(dest)
+}
+
+fn dist(x0: f32, y0: f32, x1: f32, y1: f32) -> f32 {
+    let dx = x0 - x1;
+    let dy = y0 - y1;
+    (dx * dx + dy * dy).sqrt()
+}
+
+fn dist_point_seg(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
+    let abx = bx - ax;
+    let aby = by - ay;
+    let len2 = abx * abx + aby * aby;
+    if len2 < 1.0e-4 {
+        return dist(px, py, ax, ay);
+    }
+    let t = (((px - ax) * abx + (py - ay) * aby) / len2).clamp(0.0, 1.0);
+    dist(px, py, ax + abx * t, ay + aby * t)
+}
+
+fn blend_coverage(dst: &mut Rgba<u8>, coverage: f32, color: [u8; 4]) {
+    let alpha = coverage.clamp(0.0, 1.0) * (color[3] as f32 / 255.0);
     if alpha <= 0.0 {
         return;
     }
     let inv = 1.0 - alpha;
-    // Black ink over whatever is already in the raster (usually transparent).
     for channel in 0..3 {
-        dst[channel] = (dst[channel] as f32 * inv).round() as u8;
+        dst[channel] = (color[channel] as f32 * alpha + dst[channel] as f32 * inv).round() as u8;
     }
     let dst_a = dst[3] as f32 / 255.0;
     let out_a = alpha + dst_a * inv;
@@ -1528,8 +2538,9 @@ fn blend_coverage(dst: &mut Rgba<u8>, coverage: f32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Stamp, burn, default_image_box, force_visible_alpha, keep_on_page, load_font, measure_text,
-        rasterize_text, wrap_lines,
+        LayerTo, Stamp, burn, default_image_box, force_visible_alpha, keep_on_page,
+        layer_destination, load_font, measure_text, rasterize_ink, rasterize_text, split_stroke,
+        wrap_lines,
     };
     use image::{Rgb, RgbImage, Rgba, RgbaImage};
 
@@ -1606,8 +2617,45 @@ mod tests {
         let lines = wrap_lines(&font, "aaa aaa", 32.0, word_w + 0.5);
         assert_eq!(lines.len(), 2, "{lines:?}");
 
-        let image = rasterize_text(&font, "Hi", 48.0, 400.0);
+        let image = rasterize_text(&font, "Hi", 48.0, 400.0, [0, 0, 0, 255]);
         assert!(image.pixels().any(|pixel| pixel[3] > 0));
         assert!(image.width() >= 8 && image.height() >= 8);
+    }
+
+    #[test]
+    fn pen_stroke_raster_is_colored_and_leaves_the_corner_clear() {
+        let image = rasterize_ink(
+            50.0,
+            24.0,
+            &[(8.0, 12.0), (40.0, 12.0)],
+            5.0,
+            [200, 10, 10, 255],
+        );
+        assert!(image.get_pixel(12, 12)[0] > 150);
+        assert_eq!(image.get_pixel(0, 0)[3], 0);
+    }
+
+    #[test]
+    fn eraser_splits_a_stroke_where_it_crosses() {
+        let runs = split_stroke(
+            &[(0.0, 0.0), (10.0, 0.0), (20.0, 0.0), (30.0, 0.0)],
+            15.0,
+            0.0,
+            3.0,
+        );
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0], vec![(0.0, 0.0)]);
+        assert_eq!(runs[1], vec![(30.0, 0.0)]);
+    }
+
+    #[test]
+    fn layer_moves_stop_at_the_ends() {
+        assert_eq!(layer_destination(0, 3, LayerTo::Forward), Some(1));
+        assert_eq!(layer_destination(1, 3, LayerTo::Backward), Some(0));
+        assert_eq!(layer_destination(0, 3, LayerTo::Front), Some(2));
+        assert_eq!(layer_destination(2, 3, LayerTo::Back), Some(0));
+        assert_eq!(layer_destination(2, 3, LayerTo::Front), None);
+        assert_eq!(layer_destination(0, 3, LayerTo::Back), None);
+        assert_eq!(layer_destination(0, 1, LayerTo::Forward), None);
     }
 }
